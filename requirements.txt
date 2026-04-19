@@ -1,0 +1,6 @@
+requests>=2.31,<3
+pandas>=2.0,<3
+click>=8.0,<9
+tenacity>=8.0,<9
+pytest>=7.0
+flake8>=6.0
