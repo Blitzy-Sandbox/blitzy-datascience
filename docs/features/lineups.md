@@ -81,6 +81,23 @@ The two invocations differ by **request parameters, not by endpoint**. Because p
 
 This is NOT a case of duplicated work. It is a deliberate use of a single upstream endpoint for two distinct analytics questions, consistent with the "Immutable upstream interface" constraint in AAP §0.1.2: the pipeline does not abstract or proxy the NBA Stats API, so the same endpoint name appearing in two pipelines is expected whenever two pipelines need two different parameter slices of the same upstream resource. See [`../api/endpoints_catalog.md#leaguedashplayerclutch`](../api/endpoints_catalog.md#leaguedashplayerclutch) for the authoritative parameter reference that spells out the two variants.
 
+#### Key-level parameter delta between the two variants
+
+Although the two variants differ semantically (clutch-time splits vs. on/off-court splits), the key-level difference between the two `params` dicts is **narrow and single-key**. This is expected because NBA Stats API endpoints generally accept a superset of filter parameters and interpret the response shape by which filters are populated — not by a dedicated mode flag. Operators and test authors should be aware of the exact key delta:
+
+| Variant | Wrapper function | Endpoint string | Key count | Includes `TwoWay`? |
+|---|---|---|---|---|
+| Clutch-time splits (F-009 Players) | `endpoints.players.fetch_leaguedashplayerclutch` | `leaguedashplayerclutch` | 38 | **No** — the `TwoWay` key is OMITTED |
+| On/off-court splits (F-012 Lineups) | `endpoints.lineups.fetch_leaguedashplayerclutch_onoff` | `leaguedashplayerclutch` | 39 | **Yes** — the `TwoWay` key is PRESENT (value `"0"`) |
+
+The **sole key-level difference is the presence (Lineups) or absence (Players) of the `TwoWay` key** (13 clutch/player-filter keys — `College`, `Country`, `DraftPick`, `DraftYear`, `Height`, `Weight`, `PlayerExperience`, `PlayerPosition`, `StarterBench`, `Conference`, `ClutchTime`, `AheadBehind`, `PointDiff` — are shared between both variants with identical values). Shared values by themselves do not cause a collision because:
+
+1. **Endpoint string identity** — both wrappers call the same upstream `leaguedashplayerclutch`, so upstream-side deduplication is not meaningful.
+2. **Wrapper function identity** — the two wrappers are distinct Python objects with distinct names (`fetch_leaguedashplayerclutch` vs. `fetch_leaguedashplayerclutch_onoff`). Call sites cannot confuse them at the Python level.
+3. **Checkpoint key namespacing** — see Section 7. The Lineups pipeline writes `lineups:leaguedashplayerclutch_onoff:<season>`; the Players pipeline writes `players:leaguedashplayerclutch:<season>`. These do not collide even though the underlying endpoint string is identical.
+
+Test coverage for this disambiguation is enforced by `tests/unit/endpoints/test_lineups.py` (the `TestDisambiguation` class) which verifies (a) both wrappers call the same upstream endpoint string, (b) the wrappers are distinct Python function objects, (c) the Players variant has 38 keys and omits `TwoWay`, (d) the Lineups variant has 39 keys and includes `TwoWay`, (e) the keyset-symmetric-difference equals exactly `{"TwoWay"}`, and (f) the 13 shared clutch/player-filter keys carry identical values in both variants. Future contributors changing either variant MUST also update these assertions to keep the delta explicit.
+
 ## 5. Data Flow
 
 ```mermaid
