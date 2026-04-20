@@ -1,12 +1,16 @@
-# Runtime artifacts (excluded from version control per AAP §0.2.3, §0.6.1.7)
-output/
-logs/
-
 # Python bytecode and caches
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
+
+# Python packaging artifacts (defensive; not produced by this project but commonly appear)
+build/
+dist/
+*.egg
+*.egg-info/
+.eggs/
+*.whl
 
 # Virtual environments
 .venv/
@@ -14,34 +18,35 @@ __pycache__/
 venv/
 env/
 ENV/
+.python-version
 
-# Test caches and coverage
+# Test runner and linter caches
 .pytest_cache/
-.tox/
-.nox/
+.cache/
+.mypy_cache/
+.ruff_cache/
 .coverage
-.coverage.*
 htmlcov/
-coverage.xml
-*.cover
-.hypothesis/
+.tox/
 
-# Distribution / packaging
-*.egg-info/
-*.egg
-dist/
-build/
-.eggs/
-pip-wheel-metadata/
+# Runtime artifacts produced by this project (AAP §0.6.1.7)
+output/
+logs/
+*.log
 
-# IDE and OS metadata
-.idea/
+# Environment files (tracked template .env.example is intentionally NOT ignored per AAP §0.6.1.4)
+.env
+.env.local
+.env.*.local
+
+# Editor and IDE files
 .vscode/
+.idea/
 *.swp
 *.swo
+*~
 .DS_Store
 Thumbs.db
 
-# Local environment overrides
-.env
-.env.local
+# Jupyter / notebooks (defensive; not used, but prevents accidental commit)
+.ipynb_checkpoints/
