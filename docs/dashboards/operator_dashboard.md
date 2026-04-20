@@ -19,8 +19,12 @@ are defined there. This file is the visualization layer.
 ## 1. When to use this dashboard
 
 - **Prefer `operator_dashboard.json`** if you already have Grafana and a Prometheus
-  server scraping the pipeline host. That file renders the six counters plus the
-  two companion histograms as time-series panels.
+  server scraping the pipeline host. That file renders the six canonical
+  counters as a mix of stat, timeseries, and piechart panels; the two companion
+  histograms (`nba_request_duration_seconds`, `pipeline_duration_seconds`) are
+  exposed by `python run.py metrics` but not yet dashboarded — see
+  `docs/OBSERVABILITY.md` §"Future work — histograms exposed but not yet
+  dashboarded" for the rationale and forward plan.
 - **Use this Markdown file** if running locally, on a CI box, or anywhere without
   Grafana — combine the tables below with `python run.py metrics` invocations to
   produce the same operational picture on a developer laptop.

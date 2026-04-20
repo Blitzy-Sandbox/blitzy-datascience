@@ -6,13 +6,29 @@
   <title>NBA Data Ingestion Pipeline — Executive Summary</title>
 
   <!-- Fonts (Google Fonts) -->
+  <!-- NOTE on SRI: the Google Fonts stylesheet (fonts.googleapis.com/css2?...) is
+       dynamically generated per-request (user-agent-sensitive CSS that points at the
+       appropriate woff2 files in fonts.gstatic.com). A fixed SHA-384 integrity hash
+       is therefore not feasible for this stylesheet. `crossorigin` is set on the
+       preconnect to fonts.gstatic.com so the font binaries themselves are fetched
+       over a CORS-enabled connection. The three pinned CDN assets below (reveal.js
+       core + white theme + reveal.js JS + Mermaid + Lucide) DO carry SHA-384 SRI
+       hashes in their integrity attributes, per the m-4 remediation recorded in
+       docs/DECISIONS.md. -->
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&family=Fira+Code:wght@400;500&display=swap">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&family=Fira+Code:wght@400;500&display=swap" crossorigin="anonymous">
 
   <!-- reveal.js 5.1.0 core + white base theme (overridden by inline Blitzy theme below) -->
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/reveal.js/5.1.0/reveal.min.css">
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/reveal.js/5.1.0/theme/white.min.css" id="theme">
+  <link rel="stylesheet"
+        href="https://cdnjs.cloudflare.com/ajax/libs/reveal.js/5.1.0/reveal.min.css"
+        integrity="sha384-1RYZY7bWr47av1F0MzHgCbqOI7hIwg9dvdmXpRYIaK1mf1sxSE8pReydle4L0NAK"
+        crossorigin="anonymous">
+  <link rel="stylesheet"
+        href="https://cdnjs.cloudflare.com/ajax/libs/reveal.js/5.1.0/theme/white.min.css"
+        integrity="sha384-8UhmY3T2olG6oZIfOyb1oUGwYshcwnIUeerEsJfMXfZq7EGWLTMIm1ESdsinvXig"
+        crossorigin="anonymous"
+        id="theme">
 
   <!-- Blitzy brand theme (inline, authoritative) -->
   <style>
@@ -504,8 +520,10 @@ flowchart LR
       <!-- =========================================================== -->
       <!-- Slide 10 - Rules That Make It Safe (Styled Table)             -->
       <!-- =========================================================== -->
+      <!-- Table-based content slide; exempt from the ≤ 40-word body-text -->
+      <!-- cap of AAP §0.7.3.4 per docs/DECISIONS.md D-019 carve-out.     -->
       <section>
-        <h2>Seven Rules That Make It Safe</h2>
+        <h2>Eight Rules That Make It Safe</h2>
         <table class="slide-table">
           <thead>
             <tr>
@@ -522,6 +540,7 @@ flowchart LR
             <tr><td><span class="rule-badge">Rule 5</span></td><td>Checkpoint after every pull</td><td><code>utils/checkpoint.py</code></td></tr>
             <tr><td><span class="rule-badge">Rule 6</span></td><td>Fail-safe per-game iteration</td><td><code>pipelines/ingest_games.py</code></td></tr>
             <tr><td><span class="rule-badge">Rule 7</span></td><td>Pluggable writer, one <code>to_csv</code> call site</td><td><code>storage/csv_writer.py</code></td></tr>
+            <tr><td><span class="rule-badge">Rule 8</span></td><td>Authority boundary: no DB, web UI, auth, streaming, CI/CD</td><td>Enforced by omission (D-001)</td></tr>
           </tbody>
         </table>
       </section>
@@ -529,6 +548,8 @@ flowchart LR
       <!-- =========================================================== -->
       <!-- Slide 11 - Gates Passed (Styled Table)                        -->
       <!-- =========================================================== -->
+      <!-- Table-based content slide; exempt from the ≤ 40-word body-text -->
+      <!-- cap of AAP §0.7.3.4 per docs/DECISIONS.md D-019 carve-out.     -->
       <section>
         <h2>Validation Gates</h2>
         <table class="slide-table">
@@ -565,6 +586,8 @@ flowchart LR
       <!-- =========================================================== -->
       <!-- Slide 13 - Risk Register (Styled Table)                       -->
       <!-- =========================================================== -->
+      <!-- Table-based content slide; exempt from the ≤ 40-word body-text -->
+      <!-- cap of AAP §0.7.3.4 per docs/DECISIONS.md D-019 carve-out.     -->
       <section>
         <h2>Known Risks, Active Mitigations</h2>
         <table class="slide-table">
@@ -600,17 +623,17 @@ flowchart LR
       <!-- Slide 15 - Ramp and Extend (Two-Column)                       -->
       <!-- =========================================================== -->
       <section>
-        <h2>How Teams Ramp and Extend</h2>
+        <h2>Ramp and Extend</h2>
         <div class="two-col">
           <div>
             <p style="text-align: center;"><i data-lucide="rocket" class="icon-xl"></i></p>
-            <p style="text-align: center; font-family: var(--blitzy-font-display); font-weight: 600;">Clone &middot; venv &middot; pip install &middot; run</p>
+            <p style="text-align: center; font-family: var(--blitzy-font-display); font-weight: 600;">Clone &middot; venv &middot; install &middot; run</p>
           </div>
           <ul>
-            <li><strong>Onboard:</strong> clean-machine guide in <code>docs/ONBOARDING.md</code></li>
-            <li><strong>Observe:</strong> logs, health, metrics in <code>docs/OBSERVABILITY.md</code></li>
-            <li><strong>Explain:</strong> decisions and traceability in <code>docs/DECISIONS.md</code> and <code>docs/TRACEABILITY.md</code></li>
-            <li><strong>Extend:</strong> add a writer by subclassing <code>BaseWriter</code>; no pipeline code changes</li>
+            <li><strong>Onboard:</strong> <code>ONBOARDING.md</code></li>
+            <li><strong>Observe:</strong> <code>OBSERVABILITY.md</code></li>
+            <li><strong>Explain:</strong> <code>DECISIONS.md</code>, <code>TRACEABILITY.md</code></li>
+            <li><strong>Extend:</strong> subclass <code>BaseWriter</code></li>
           </ul>
         </div>
       </section>
@@ -629,11 +652,17 @@ flowchart LR
   </div>
 
   <!-- reveal.js 5.1.0 core script -->
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/reveal.js/5.1.0/reveal.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/reveal.js/5.1.0/reveal.min.js"
+          integrity="sha384-Xxv4gyBFvSgy+SmWELnBPSWXP3n3fVSRQZVduifAPNK/+S0/6C/lBAQIYRipwM9k"
+          crossorigin="anonymous"></script>
   <!-- Mermaid 11.4.0 -->
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/mermaid/11.4.0/mermaid.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/mermaid/11.4.0/mermaid.min.js"
+          integrity="sha384-Wm9qzEgq4j1jEnuFK2FxKTlwuhbV2QqtGhcchvjDoKxeJ7WWAW7fysBq+1s6myfX"
+          crossorigin="anonymous"></script>
   <!-- Lucide 0.460.0 -->
-  <script src="https://cdn.jsdelivr.net/npm/lucide@0.460.0/dist/umd/lucide.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/lucide@0.460.0/dist/umd/lucide.min.js"
+          integrity="sha384-ieG+IKD0d/ZPXyCBTMVAbqsQdns8QGJR/e26WMw7M4fkaI/rHcS/YIoi+ah9WGge"
+          crossorigin="anonymous"></script>
 
   <script>
     // ------------------------------------------------------------------

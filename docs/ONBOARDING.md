@@ -349,7 +349,7 @@ All CSVs are UTF-8 encoded and written with `index=False` so there is no leading
 
 **Cause:** the process does not have write permission to the project root (common on shared servers or restricted corporate laptops).
 
-**Fix:** either `chmod u+w .` on the project root, or relocate the output via `export BLITZY_OUTPUT_DIR=$HOME/nba_output` before running. The `config.py` module picks up environment-variable overrides for `OUTPUT_DIR` and `LOG_FILE`; see `.env.example` for the full list.
+**Fix:** either `chmod u+w .` on the project root, or relocate the output via `export NBA_OUTPUT_DIR=$HOME/nba_output` before running. The `config.py` module picks up environment-variable overrides for `OUTPUT_DIR` and `LOG_FILE`; see `.env.example` for the full list.
 
 ### Pitfall 8: Pipeline hangs with no log output
 
@@ -419,9 +419,9 @@ The architecture is deliberately layered so that each extension pattern touches 
 `config.py` reads a handful of values from environment variables at import time, with sensible defaults baked in. To override any of them for a single run:
 
 ```bash
-export BLITZY_OUTPUT_DIR=/tmp/my_nba_output
-export BLITZY_RATE_LIMIT_SECONDS=2.0
-export BLITZY_LOG_LEVEL=DEBUG
+export NBA_OUTPUT_DIR=/tmp/my_nba_output
+export NBA_RATE_LIMIT_SECONDS=2.0
+export NBA_LOG_LEVEL=DEBUG
 python run.py all --season 2025-26
 ```
 

@@ -373,20 +373,22 @@ Two dashboard templates ship with the repository to match two operator environme
 
 [`operator_dashboard.json`](./dashboards/operator_dashboard.json) is a Grafana-compatible dashboard template that renders the six counters above as panels. Import it via *Dashboards → Import → Upload JSON*. It expects a Prometheus data source; point it at whatever mechanism scrapes `python run.py metrics` (file-sd, Pushgateway, or a future `/metrics` HTTP endpoint).
 
-Panels included:
+Panels included (in panel order, exactly as rendered by `operator_dashboard.json`):
 
-1. **NBA Requests** — `rate(nba_requests_total[5m])` by endpoint.
-2. **Request Failures** — `rate(nba_request_failures_total[5m])` by endpoint and reason.
-3. **Retry Pressure** — `rate(nba_retries_total[5m])`.
-4. **Pipeline Throughput** — `rate(pipeline_rows_written_total[5m])` by pipeline and artifact.
-5. **Pipeline Outcomes** — running totals of `pipeline_runs_total` by outcome (`success` vs. `error`).
-6. **Games Failed (Rule 6)** — running total of `games_failed_total` by reason.
-7. **NBA Request Latency** — `histogram_quantile(0.95, sum(rate(nba_request_duration_seconds_bucket[5m])) by (le, endpoint))`.
-8. **Pipeline Duration** — `histogram_quantile(0.95, sum(rate(pipeline_duration_seconds_bucket[5m])) by (le, pipeline))`.
+1. **Total Requests (24h)** — `sum(increase(nba_requests_total[24h]))` — stat panel summarizing total HTTPS GETs issued by `api/nba_client.py` over the last 24 hours.
+2. **Permanent Failures (24h)** — `sum(increase(nba_request_failures_total[24h]))` — stat panel counting requests that exhausted `tenacity` retries and were recorded as permanent failures.
+3. **Retries / Request Ratio** — `sum(rate(nba_retries_total[5m])) / clamp_min(sum(rate(nba_requests_total[5m])), 1)` — stat panel showing transient-retry pressure as a ratio; values > 0.2 indicate upstream instability or too-aggressive `RATE_LIMIT_SECONDS`.
+4. **Games Failures (Rule 6 absorptions, 24h)** — `sum(increase(games_failed_total[24h]))` — stat panel counting per-`GAME_ID` failures absorbed by the Rule 6 `try/except` in `pipelines/ingest_games.py`.
+5. **Requests per endpoint (rate/5m)** — `sum by (endpoint) (rate(nba_requests_total[5m]))` — timeseries panel breaking down request rate by NBA Stats endpoint.
+6. **Rows Written per pipeline (increase/1h)** — `sum by (pipeline) (increase(pipeline_rows_written_total[1h]))` — timeseries panel showing hourly row-write throughput per domain pipeline.
+7. **Pipeline Run Outcomes (24h)** — `sum by (outcome) (increase(pipeline_runs_total[24h]))` — piechart showing the `success`/`error` distribution of pipeline invocations over 24 hours.
+8. **Retries by endpoint (rate/5m)** — `sum by (endpoint) (rate(nba_retries_total[5m]))` — timeseries panel pinpointing which endpoints are driving transient retries.
+
+> **Future work — histograms exposed but not yet dashboarded.** `utils/metrics.py` pre-registers two histograms via `describe_histogram(...)` — `nba_request_duration_seconds` (latency of individual NBA Stats API calls by endpoint) and `pipeline_duration_seconds` (wall-clock duration of each pipeline invocation). They are emitted by `python run.py metrics` in Prometheus text exposition format (`_bucket`, `_sum`, `_count` series) and are available to any Prometheus server that scrapes the output. However, the initial `operator_dashboard.json` does **not** yet include dedicated p95-latency or p95-duration panels for them; a subsequent checkpoint will add two `histogram_quantile(0.95, …)` timeseries panels to complete the latency observability picture. Until then, operators can query the histograms ad hoc via `grep nba_request_duration_seconds <(python run.py metrics)` or `grep pipeline_duration_seconds <(python run.py metrics)`.
 
 ### Markdown (fallback)
 
-[`operator_dashboard.md`](./dashboards/operator_dashboard.md) is a Grafana-free operator dashboard suitable for environments without Grafana. It lists the same six metrics with their PromQL queries, provides sample `grep`/`awk` commands that produce equivalent snapshots from the raw metrics output, and documents alerting thresholds for each counter.
+[`operator_dashboard.md`](./dashboards/operator_dashboard.md) is a Grafana-free operator dashboard suitable for environments without Grafana. It lists the same six counters with PromQL queries aligned to the Grafana panels above, provides sample `grep`/`awk` commands that produce equivalent snapshots from the raw metrics output, and documents alerting thresholds for each counter.
 
 ---
 

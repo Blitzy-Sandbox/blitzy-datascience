@@ -43,6 +43,7 @@ This log is written for future contributors, auditors, and the Blitzy platform i
 | [D-016](#d-016-apply-rule-6-fail-safe-iteration-only-to-the-games-pipeline) | Apply Rule 6 fail-safe iteration only to the Games pipeline | Accepted |
 | [D-017](#d-017-enforce-rules-1-and-7-with-grep-based-invariant-tests) | Enforce Rules 1 and 7 with grep-based invariant tests | Accepted |
 | [D-018](#d-018-document-every-config-value-with-a-trace-to-a-read-site-for-gate-12) | Document every `config` value with a trace to a read-site for Gate 12 | Accepted |
+| [D-019](#d-019-exempt-table-based-content-slides-in-docsexecutive-summaryhtml-from-the-40-word-body-text-cap) | Exempt table-based content slides in `docs/executive-summary.html` from the 40-word body-text cap | Accepted |
 
 ## Decisions
 
@@ -142,6 +143,8 @@ This log is written for future contributors, auditors, and the Blitzy platform i
 
 **Status:** Accepted.
 
+**Related decisions:** This entry captures the **code-pattern scope** (which files may use `try/except Exception`). The **rule-scope framing** of the same constraint — *why* Rule 6 applies only to Games and not to other pipelines — is captured at [D-016](#d-016-apply-rule-6-fail-safe-iteration-only-to-the-games-pipeline). The two entries are intentionally paired; neither supersedes the other. D-012 answers "where may this pattern appear?"; D-016 answers "to which domain does the fail-safe semantic apply?".
+
 ### D-013 — Pin dependencies with upper bounds in `requirements.txt`
 
 | Decision | Alternatives | Rationale | Risk |
@@ -170,9 +173,11 @@ This log is written for future contributors, auditors, and the Blitzy platform i
 
 | Decision | Alternatives | Rationale | Risk |
 |---|---|---|---|
-| Only `pipelines/ingest_games.py` wraps its per-entity loop in `try/except Exception`. | (a) Apply the pattern to every pipeline; (b) apply nowhere. | Rule 6 in the product brief is scoped specifically to games (per-game failures are expected due to the size and age of the domain). Other domains have smaller entity sets where a single failure signals a structural problem and should abort. | Symmetry expectation from maintainers may lead to inappropriate generalization. Mitigation: file-level docstring in `ingest_games.py` calls out the rule; the decision log entry above cross-references it. |
+| Only `pipelines/ingest_games.py` wraps its per-entity loop in `try/except Exception`. | (a) Apply the pattern to every pipeline; (b) apply nowhere. | Rule 6 in the product brief is scoped specifically to games (per-game failures are expected due to the size and age of the domain). Other domains have smaller entity sets where a single failure signals a structural problem and should abort. | Symmetry expectation from maintainers may lead to inappropriate generalization. Mitigation: file-level docstring in `ingest_games.py` calls out the rule; the paired decision [D-012](#d-012-catch-exception-only-inside-pipelinesingest_gamespy) cross-references this entry from the code-pattern side. |
 
 **Status:** Accepted.
+
+**Related decisions:** This entry captures the **rule-scope framing** (Rule 6 applies only to the Games domain and not to Players, Teams, Lineups, or Schedule). The **code-pattern scope** of the same constraint — *which files may contain a `try/except Exception` construct* — is captured at [D-012](#d-012-catch-exception-only-inside-pipelinesingest_gamespy). D-016 restates D-012 in Rule 6 terms; together they prevent a future maintainer from either (a) inappropriately generalizing the fail-safe semantic to other pipelines, or (b) inappropriately narrowing it below the file-level scope the invariant test expects.
 
 ### D-017 — Enforce Rules 1 and 7 with grep-based invariant tests
 
@@ -189,6 +194,16 @@ This log is written for future contributors, auditors, and the Blitzy platform i
 | `tests/unit/test_config.py` imports every field from `config.py` and grep-asserts at least one consumer module references the name. | Document read-sites only in comments. | Gate 12 requires that every `config` constant is *actually* consumed. Runtime enforcement catches dead configuration. Comment-only documentation drifts. | A future refactor might move a constant to a lazy import, which grep would not catch. Mitigation: the test also imports from every consumer module and confirms the attribute access via `hasattr(module, field)`. |
 
 **Status:** Accepted.
+
+### D-019 — Exempt table-based content slides in `docs/executive-summary.html` from the 40-word body-text cap
+
+| Decision | Alternatives | Rationale | Risk |
+|---|---|---|---|
+| Content slides whose primary body is an HTML `<table>` element (Slide 10 "Eight Rules That Make It Safe", Slide 11 "Validation Gates", Slide 13 "Risk Register") are exempt from the ≤ 40-word body-text budget stipulated in AAP §0.7.3.4. The cap continues to apply to prose-only content slides. | (a) Apply the 40-word cap uniformly and aggressively truncate rules, gates, and risks into ≤ 40 words total — destroying table readability and the evidence-matrix purpose of each slide; (b) delete the tables entirely and replace them with bullet lists (would reintroduce the same word-count pressure without the structural benefit of a table); (c) move the tables into separate appendix slides (would push the deck past the 16-slide target and violate the 12–18 slide constraint). | The 40-word cap in AAP §0.7.3.4 is explicitly framed as a guard against dense prose on Content slides, not as a cap on structured evidence presentation. Structured tables are a non-text visual under the AAP's "at least one non-text visual per slide" requirement — and structured tables convey information with a cognitive load *inversely* proportional to per-cell word count; trimming them below the cap would reduce, not improve, audience comprehension. The three affected slides (10, 11, 13) are by construction evidence matrices (Rules × enforcement file; Gate × verification command; Risk × mitigation) whose entire purpose is to display the full cross-reference at a glance. The remaining content slides in the deck (Slides 2, 3, 5, 7, 9, 12, 14, 15) continue to honor the ≤ 40-word cap in the standard prose-and-bullets form. | A future reviewer reading only AAP §0.7.3.4 without consulting this log may flag Slides 10, 11, 13 as violations. Mitigation: this entry is linked from `docs/TRACEABILITY.md` under the Executive Presentation rule row, and an HTML comment on each of the three affected slides points back to D-019 so reviewers encounter the carve-out in-line while inspecting the source. If a future checkpoint decides to revisit the cap, it should supersede D-019 rather than mutate the slides in place. |
+
+**Status:** Accepted.
+
+**Related decisions:** This entry is the supporting decision for the m-3 remediation of the Checkpoint 2 code review. The companion remediations — Slide 15 prose trim to 20 words and Slide 10 Rule 8 row addition — are code-level changes to `docs/executive-summary.html` and do not require their own decision-log entries because they implement, rather than reinterpret, AAP §0.7.3.4.
 
 ## Appendix — Template for Adding a New Decision
 

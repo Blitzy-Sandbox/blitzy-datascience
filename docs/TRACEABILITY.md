@@ -271,8 +271,8 @@ Run these greps from the repository root to confirm 100% coverage has not regres
 | Features (F-001 … F-013) | 13 | Section 3 |
 | Operational rules (1 … 8) | 8 | Section 4 |
 | Validation gates (1, 2, 8, 9, 10, 12, 13) | 7 | Section 5 |
-| Source files in Reverse Index | 25 (CLI 1 + Config 1 + Transport 2 + Endpoints 6 + Pipelines 6 + Storage 2 + Utilities 8 — `__init__.py` included) | Section 6 |
-| Test files in Reverse Index | 25 (unit 18 + integration 2 + invariants 3 + `conftest.py` + `__init__.py` omitted) | Section 6 |
+| Source files in Reverse Index | 26 (CLI 1 + Config 1 + Transport 2 + Endpoints 6 + Pipelines 6 + Storage 2 + Utilities 8 — `__init__.py` included) | Section 6 |
+| Test files in Reverse Index | 26 (unit 20 + integration 2 + invariants 3 + `conftest.py` 1 — `__init__.py` package markers omitted) | Section 6 |
 | CSV artifacts | 7 | Section 6 Runtime Artifacts |
 
 If these counts drift without a corresponding update to this document, the matrix has decayed and Gate 10 must fail until restored.
