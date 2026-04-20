@@ -92,7 +92,7 @@ from requests.exceptions import HTTPError, RequestException, Timeout
 from tenacity import (
     RetryCallState,
     retry,
-    retry_if_exception_type,
+    retry_if_exception,
     stop_after_attempt,
     wait_exponential,
 )
@@ -160,6 +160,73 @@ def _retry_log_before_sleep(retry_state: RetryCallState) -> None:
         retry_state.attempt_number,
         exc,
     )
+
+
+# ---------------------------------------------------------------------------
+# Module-level tenacity ``retry`` predicate
+# ---------------------------------------------------------------------------
+# AAP §0.5.2.1 contract — the retry decorator MUST distinguish transient
+# transport failures (which are worth retrying) from permanent client
+# errors (which MUST propagate immediately so the caller can react).
+#
+# Using ``retry_if_exception_type(HTTPError)`` is too broad because
+# :meth:`requests.Response.raise_for_status` raises :class:`HTTPError` for
+# *every* non-2xx status uniformly — including permanent 4xx statuses
+# (400 Bad Request, 401 Unauthorized, 403 Forbidden, 404 Not Found,
+# 418 I'm a teapot, 422 Unprocessable Entity, etc.). Retrying those
+# wastes NBA Stats API budget, masks configuration errors behind long
+# exponential-backoff delays, and risks triggering upstream abuse
+# protections.
+#
+# This predicate inspects the HTTP status code attached to the
+# :class:`HTTPError` and retries only on:
+#   * 429 Too Many Requests (rate-limited; reactive backoff wins)
+#   * any 5xx server error (server-side transient)
+#   * :class:`Timeout` / :class:`ConnectionError` (transport-layer
+#     transient)
+#
+# Everything else — including :class:`HTTPError` without an attached
+# response, and any other exception type — is treated as non-transient
+# and propagates on the first attempt.
+# ---------------------------------------------------------------------------
+def _is_transient(exc: BaseException) -> bool:
+    """Return True iff ``exc`` represents a transient transport failure.
+
+    Parameters
+    ----------
+    exc
+        The exception raised by the most recent attempt of the decorated
+        function. Tenacity supplies it via
+        :attr:`tenacity.RetryCallState.outcome`.
+
+    Returns
+    -------
+    bool
+        ``True`` when the caller should retry (socket timeout, dropped
+        connection, HTTP 429, or HTTP 5xx); ``False`` otherwise. The
+        default ``False`` covers the permanent-4xx case called out in
+        AAP §0.5.2.1 and any non-allowlisted exception type.
+    """
+    # Transport-layer transients: retrying is almost always productive
+    # because these failures rarely reflect a permanent state of the
+    # upstream.
+    if isinstance(exc, (Timeout, RequestsConnectionError)):
+        return True
+
+    # HTTP-level failures: discriminate by status code. The defensive
+    # ``getattr`` chain accommodates both real ``requests``-produced
+    # :class:`HTTPError` instances (which always carry a populated
+    # ``.response``) and any synthetic instances that may not.
+    if isinstance(exc, HTTPError):
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        # Retry on rate-limit (429) or any server-side error (5xx).
+        # Permanent client errors (other 4xx) and malformed errors
+        # without a response are NOT retried.
+        return status == 429 or (status is not None and status >= 500)
+
+    # Anything else — ``ValueError``, ``KeyError``, programmer errors —
+    # is by definition non-transient for this client.
+    return False
 
 
 class NBAClient:
@@ -379,9 +446,7 @@ class NBAClient:
             min=config.RETRY_MIN_WAIT,
             max=config.RETRY_MAX_WAIT,
         ),
-        retry=retry_if_exception_type(
-            (Timeout, RequestsConnectionError, HTTPError)
-        ),
+        retry=retry_if_exception(_is_transient),
         before_sleep=_retry_log_before_sleep,
         reraise=True,
     )
