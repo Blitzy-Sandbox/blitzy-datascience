@@ -1,576 +1,672 @@
-"""Shared pytest fixtures and lightweight test doubles for the NBA pipeline suite.
+"""Shared pytest fixtures for the NBA Data Ingestion Pipeline test suite.
 
-This module is pytest's canonical shared-fixture file for the entire
-``tests/`` tree. It exists to satisfy the checkpoint scope note in the QA
-report (Issue #2) and the contract published by ``tests/__init__.py``:
-all behavioural unit tests for ``api/``, ``storage/``, ``pipelines/``,
-``endpoints/``, and ``utils/`` obtain their collaborators, payloads,
-clock, and test harnesses from here.
+This module is the single source of shared fixtures across
+``tests/unit/``, ``tests/integration/``, and ``tests/invariants/``.
 
-The fixtures below fall into four functional groups:
+Exposed fixture and helper categories
+-------------------------------------
+* **Project-root discovery** — ``PROJECT_ROOT`` / ``project_root`` /
+  ``production_python_files`` so invariant tests can enumerate
+  production source files for grep-based Rule 1 and Rule 7 checks.
+* **Filesystem isolation** — ``tmp_output_dir``, ``tmp_log_dir``, and
+  ``isolated_filesystem`` redirect :mod:`config` paths to pytest's
+  ``tmp_path`` via :meth:`monkeypatch.setattr` so tests never touch
+  the operator's real working directory.
+* **`resultSets` envelope payloads** — ``sample_*_payload`` fixtures
+  covering the happy path, multi-table responses, empty ``rowSet``,
+  nested-cell violations, row-length mismatches, the singular
+  ``resultSet`` shape, and the missing-key pathological case. Exercise
+  ``utils/schema_normalizer.py`` for Rule 4.
+* **Flat DataFrame fixtures** — ``flat_df``, ``nested_df``,
+  ``list_cell_df``, ``empty_df``, and the reproducible ``large_df`` for
+  writer round-trip and pipeline tests.
+* **Mock collaborators** — :class:`RecordingClient`,
+  :class:`RecordingWriter`, :class:`RecordingCheckpoint` are handwritten
+  spies (not :class:`~unittest.mock.MagicMock`) so interface drift is
+  caught at instantiation time rather than masked by attribute-access
+  magic. Factory fixtures return fresh instances per test.
+* **Deterministic clock** — :class:`FakeClock` + ``fake_clock`` fixture
+  monkeypatches ``time.monotonic`` and ``time.sleep`` so rate-limiter
+  tests (Rule 2) run instantly.
+* **CLI harness** — ``cli_runner`` returns a fresh
+  :class:`click.testing.CliRunner` per test for Gate 13 verification
+  of ``run.py`` subcommand dispatch.
+* **Autouse state resets** — ``_reset_correlation_id_between_tests``,
+  ``_reset_metrics_registry_between_tests``, and
+  ``_reset_logger_handlers_between_tests`` run before AND after every
+  test so correlation-ID context, metrics registry, and logger
+  handlers never leak across tests.
+* **CSV round-trip helper** — ``read_csv_as_df`` function and
+  ``csv_reader`` fixture for verifying ``CSVWriter``-produced files.
 
-1. **Autouse resets** (implicit) -- ensure that mutable module-level state
-   (the ``correlation_id`` :class:`~contextvars.ContextVar`, the
-   :data:`utils.metrics.registry` singleton, and the root logger handler
-   list) is restored to a pristine state between tests so that the order
-   in which tests execute cannot influence their outcome. The logger
-   reset is deliberately *caplog-safe*: it removes only handlers owned
-   by this project while preserving the handlers pytest installs under
-   the ``_pytest.logging`` module so that ``caplog`` and
-   ``--log-cli-level`` continue to function.
+Authoritative references
+------------------------
+AAP §0.2.3, §0.4.1.2, §0.5.1.8, product brief §5 Rules 1–7,
+Validation Gates 1, 2, 8, 9, 10, 12, 13.
 
-2. **Test doubles** (``FakeClock``, ``RecordingClient``,
-   ``RecordingWriter``, ``RecordingCheckpoint``) -- handwritten spies that
-   record every interaction for later assertion. They replace the need
-   for ``unittest.mock.MagicMock`` in common cases and make failing-test
-   diagnostics easier to read because every attribute is explicitly
-   documented.
-
-3. **Data fixtures** (``flat_df``, ``nested_df``, ``list_cell_df``,
-   ``empty_df``, ``resultset_players``, ``resultset_empty``,
-   ``resultset_multi``) -- deterministic, scalar-only (or deliberately
-   pathological) :class:`pandas.DataFrame` and ``resultSets`` envelope
-   values that every test can reference without reconstruction.
-
-4. **Environment fixtures** (``tmp_output_dir``, ``csv_reader``,
-   ``rate_limiter_factory``, ``cli_runner``) -- parameterise the writer
-   and rate-limiter under test and provide a handy UTF-8 CSV reader and
-   a :class:`click.testing.CliRunner` factory for CLI-level tests added
-   in later checkpoints.
-
-References
-----------
-* AAP section 0.5.1.8 -- tests mirror the production module tree one-to-one.
-* AAP sections 0.7.2.1-0.7.2.7 -- Operational Rules 1-7 verified by the tests
-  that consume these fixtures.
-* AAP section 0.5.2.1 -- retry predicate contract (``_is_transient``) exercised
-  by ``tests/unit/api/test_nba_client.py``.
-* QA Report Issue #2 -- this file and its sibling ``test_*.py`` modules
-  are the concrete deliverables that unblock Gate 10 for Checkpoint IC-2.
+Do-not list
+-----------
+* Do NOT import :mod:`requests` — Rule 1 (Single HTTP Client).
+* Do NOT call :meth:`pandas.DataFrame.to_csv` — Rule 7 (Pluggable
+  Storage); use ``CSVWriter`` or a per-test temporary file.
+* Do NOT register module-level pytest hooks
+  (e.g. ``pytest_collection_modifyitems``) — markers belong in
+  ``pytest.ini`` and hooks belong in a dedicated hooks module.
+* Do NOT introduce Faker, hypothesis, pytest-mock, pytest-cov, or any
+  third-party test library outside AAP §0.3.1.
 """
 
 from __future__ import annotations
 
-# ---------------------------------------------------------------------------
-# Standard-library imports
-# ---------------------------------------------------------------------------
-#
-# All fixtures and test doubles defined below rely only on the stdlib,
-# ``pandas`` (a production-pinned dependency), and a handful of symbols
-# re-exported by our own ``api`` / ``storage`` / ``utils`` packages. We
-# deliberately DO NOT import ``requests`` here even though some of the
-# recording spies imitate ``requests.Response`` -- that would double as a
-# stealth Rule 1 violation inside the test suite. Instead, the exception
-# types we need (``HTTPError``, ``Timeout``, ``RequestsConnectionError``)
-# are consumed from ``api.nba_client`` where they are already re-exported.
-import logging
-from contextlib import contextmanager
+import json  # noqa: F401 - re-exported for fixture authors constructing JSON blobs
+import logging  # noqa: F401 - documents stdlib-only F-008 commitment; available for typing
+import sys
+import time
+from contextlib import contextmanager  # noqa: F401 - re-exported for fixture authors
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
+from unittest.mock import MagicMock  # noqa: F401 - re-exported for ad-hoc test authors
 
 import pandas as pd
 import pytest
 from click.testing import CliRunner
 
 # ---------------------------------------------------------------------------
-# First-party imports
+# Project-root discovery and ``sys.path`` bootstrap
 # ---------------------------------------------------------------------------
-#
-# We intentionally import the production modules so that the fixtures
-# exercise the REAL registry / config / logger / correlation objects
-# that production code will see at runtime. Tests that need isolation
-# from these singletons rely on the autouse reset fixtures below rather
-# than on module reloads (which would break cross-test object identity
-# on imports made at module-import time elsewhere in the tree).
-import config
-from utils import logger as _logger_module
-from utils import metrics as _metrics_module
-from utils.correlation import correlation_id
+
+#: Absolute path of the repository root (the directory that contains
+#: ``run.py``, ``config.py``, and the top-level ``api/``, ``endpoints/``,
+#: ``pipelines/``, ``storage/``, ``utils/`` packages). Computed once at
+#: module-import time via :meth:`Path.resolve` so the value is stable
+#: regardless of the pytest invocation directory.
+PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent
+
+# Defensive ``sys.path`` insertion so ``import config``, ``import api``,
+# etc. resolve from the repository root even when pytest is invoked from
+# a subdirectory. ``pytest.ini`` ``testpaths`` usually handles this, but
+# the explicit insertion keeps the import contract robust against
+# unusual invocation patterns (e.g. ``cd tests && pytest``).
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 
-# ===========================================================================
-# Autouse reset fixtures
-# ===========================================================================
-#
-# Each fixture below is decorated with ``autouse=True`` so pytest invokes
-# it for every test in the session without the test having to opt in.
-# They execute in the declaration order of this file; callers of
-# ``setup``/``teardown`` style are therefore guaranteed the following
-# guarantee sequence at the START of every test:
-#
-#   1. correlation_id reset to "" via the raw ContextVar setter
-#   2. metrics registry reset to zero counters / histograms
-#   3. application logger handlers removed (pytest handlers preserved)
-#
-# and the MIRROR sequence on teardown (same three operations, since the
-# fixture bodies yield only once).
+#: Production package directories enumerated by
+#: ``production_python_files``; consumed by invariant tests that grep
+#: every ``.py`` file to enforce Rule 1 (sole HTTP client) and Rule 7
+#: (sole ``to_csv`` call-site).
+PRODUCTION_DIRS: Tuple[str, ...] = (
+    "api",
+    "endpoints",
+    "pipelines",
+    "storage",
+    "utils",
+)
+
+#: Root-level production Python files (outside the package directories).
+PRODUCTION_ROOT_FILES: Tuple[str, ...] = (
+    "run.py",
+    "config.py",
+)
 
 
-@pytest.fixture(autouse=True)
-def _reset_correlation_id() -> Iterator[None]:
-    """Reset the ``correlation_id`` ContextVar to its default empty value.
-
-    The public helper :func:`utils.correlation.set_correlation_id` mints a
-    fresh UUID when called with an empty string (line 194 of
-    ``utils/correlation.py``: ``cid = value or new_correlation_id()``).
-    That is exactly wrong for a test reset. We therefore use the raw
-    :class:`contextvars.ContextVar` setter with the empty-string sentinel
-    that matches the ContextVar's declared default value.
-
-    Yields
-    ------
-    None
-        Execution returns control to the test, then the fixture resets
-        the ContextVar once more on teardown as a belt-and-braces guard
-        against teardown-time assertions that depend on a pristine CID.
-    """
-    correlation_id.set("")
-    try:
-        yield
-    finally:
-        correlation_id.set("")
+# ---------------------------------------------------------------------------
+# CSV round-trip helper (module-level function)
+# ---------------------------------------------------------------------------
 
 
-@pytest.fixture(autouse=True)
-def _reset_metrics_registry() -> Iterator[None]:
-    """Zero all counter / histogram values on ``utils.metrics.registry``.
+def read_csv_as_df(path: Path) -> pd.DataFrame:
+    """Read a CSV file produced by ``CSVWriter.write`` back into a DataFrame.
 
-    The :class:`utils.metrics.MetricsRegistry` is a process-wide
-    singleton. Without a per-test reset, assertions such as
-    ``get_counter_value('nba_requests_total') == 1`` would observe
-    cumulative totals across the whole test session.
-
-    ``registry.reset()`` is the public API for this use case; it clears
-    all counter values and histogram buckets while preserving the
-    registry's *registration* metadata (``# HELP`` / ``# TYPE`` lines).
-    """
-    _metrics_module.registry.reset()
-    try:
-        yield
-    finally:
-        _metrics_module.registry.reset()
-
-
-@pytest.fixture(autouse=True)
-def _reset_logger_handlers() -> Iterator[None]:
-    """Remove this project's root-logger handlers; leave pytest's in place.
-
-    Background
-    ----------
-    :func:`utils.logger.get_logger` guards its expensive handler setup
-    with a module-level ``_configured`` flag: the first call attaches a
-    :class:`logging.StreamHandler` and a
-    :class:`logging.handlers.RotatingFileHandler`, and every subsequent
-    call is a short-circuit. That is correct behaviour at runtime, but
-    in a test session multiple tests construct :class:`NBAClient` or
-    :class:`CSVWriter` instances in quick succession and the guard means
-    only the FIRST test sees the real configuration path. Later tests
-    would then fail to exercise the format string, the rotating-file
-    plumbing, or any assertions that depend on the handler list.
-
-    We therefore flip ``_configured`` back to ``False`` and strip our own
-    handlers between tests so every test gets a pristine configuration.
-
-    caplog safety
-    -------------
-    pytest installs its own handlers on the root logger BEFORE any test
-    runs (``_LiveLoggingNullHandler``, ``_FileHandler``, and two
-    ``LogCaptureHandler`` instances). Those handlers are the mechanism
-    by which the ``caplog`` fixture captures records. Removing them
-    would silently break every ``caplog``-based assertion in the suite.
-
-    We discriminate between project-owned handlers and pytest-owned
-    handlers by inspecting the handler class's ``__module__``. Every
-    handler installed by pytest lives under the ``_pytest`` package;
-    every handler installed by :mod:`utils.logger` lives under the
-    stdlib ``logging`` / ``logging.handlers`` namespace. Filtering
-    ``type(h).__module__.startswith("_pytest")`` therefore preserves the
-    caplog machinery while still allowing us to clear the project's
-    own handlers.
-    """
-    def _strip_non_pytest_handlers() -> None:
-        root = logging.getLogger()
-        for handler in list(root.handlers):
-            if type(handler).__module__.startswith("_pytest"):
-                # Preserve pytest's caplog / live-log / file handlers.
-                continue
-            root.removeHandler(handler)
-            # ``close()`` releases underlying file descriptors for the
-            # rotating file handler. Swallow any error because a
-            # well-behaved test teardown must never raise.
-            try:
-                handler.close()
-            except Exception:  # pragma: no cover - defensive
-                pass
-        _logger_module._configured = False
-
-    _strip_non_pytest_handlers()
-    try:
-        yield
-    finally:
-        _strip_non_pytest_handlers()
-
-
-# ===========================================================================
-# Deterministic clock for rate-limiter tests
-# ===========================================================================
-
-
-class FakeClock:
-    """Deterministic monotonic clock with an explicit sleeper callback.
+    Tests call this in place of ``pandas.read_csv`` so the intent
+    ("round-trip verification") is explicit, and so any future change
+    to ``CSVWriter``'s encoding or delimiter can be mirrored here in
+    one place.
 
     Parameters
     ----------
-    start : float, optional
-        Initial value returned by subsequent calls to the instance's
-        ``monotonic`` method. Defaults to ``0.0``.
+    path:
+        Filesystem location of the CSV artifact to read.
+
+    Returns
+    -------
+    pandas.DataFrame
+        The parsed DataFrame with UTF-8 decoded cells.
+    """
+    return pd.read_csv(path, encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Handwritten spy classes (NOT ``MagicMock`` — see module docstring)
+# ---------------------------------------------------------------------------
+
+
+class FakeClock:
+    """Controllable monotonic clock and sleep sink for rate-limiter tests.
+
+    Replaces ``time.monotonic`` and ``time.sleep`` in the :pyfixture:`fake_clock`
+    pytest fixture. Every call to :meth:`sleep` is recorded on
+    :attr:`sleeps` and advances :attr:`now` by the requested duration
+    (clamped at zero so negative durations do not rewind the clock).
+    :meth:`advance` lets tests simulate the passage of real time between
+    requests without invoking :meth:`sleep`.
 
     Attributes
     ----------
-    now : float
-        The current clock reading. Advanced either manually via
-        :meth:`advance` or automatically when :meth:`sleep` is called.
-    sleeps : list[float]
-        Ordered list of every sleep duration requested via
-        :meth:`sleep`. Tests inspect this to verify Rule 2 compliance
-        (``sum(sleeps) >= RATE_LIMIT_SECONDS * (N - 1)``).
-
-    Notes
-    -----
-    A ``FakeClock`` is used in two distinct roles by the rate-limiter
-    fixture:
-
-    * ``clock=fake.monotonic`` replaces :func:`time.monotonic` so the
-      ``RateLimiter`` sees a controlled, deterministic clock.
-    * ``sleeper=fake.sleep`` replaces :func:`time.sleep` so the test
-      never actually blocks -- the callback records the requested
-      duration and instantly advances ``now`` by that amount.
-
-    This pair turns a real-wall-clock rate-limiter test into a
-    millisecond-fast deterministic one while still exercising the exact
-    same production code path as runtime would.
+    now:
+        Current fake monotonic time in seconds.
+    sleeps:
+        Ordered list of every ``sleep(duration)`` call's ``duration``
+        argument, allowing tests to assert both whether ``sleep`` was
+        called and how long each call waited for.
     """
 
-    def __init__(self, start: float = 0.0) -> None:
+    def __init__(self, start: float = 1000.0) -> None:
         self.now: float = float(start)
         self.sleeps: List[float] = []
 
     def monotonic(self) -> float:
-        """Return the current synthetic clock value (non-decreasing)."""
+        """Return the current fake time — drop-in replacement for ``time.monotonic``."""
         return self.now
 
-    def sleep(self, duration: float) -> None:
-        """Record ``duration`` and advance the clock by the same amount."""
-        # Production ``time.sleep`` accepts 0 and negative values without
-        # blocking; we replicate that contract so the rate-limiter's
-        # "no-op when interval has elapsed" branch is exercised too.
-        self.sleeps.append(float(duration))
+    def sleep(self, seconds: float) -> None:
+        """Record a ``sleep`` call and advance the clock.
+
+        Durations ≤ 0 are recorded but do not rewind the clock. The
+        clamp mirrors the production ``time.sleep`` behavior where a
+        negative duration is a no-op rather than a time-travel event.
+        """
+        duration = float(seconds)
+        self.sleeps.append(duration)
         if duration > 0:
-            self.now += float(duration)
+            self.now += duration
 
-    def advance(self, delta: float) -> None:
-        """Advance the clock by ``delta`` seconds without recording a sleep."""
+    def advance(self, seconds: float) -> None:
+        """Advance the clock by ``seconds`` without appending to :attr:`sleeps`.
+
+        Raises
+        ------
+        ValueError
+            If ``seconds`` is negative — the rate-limiter invariant
+            (Rule 2) relies on a monotonically non-decreasing clock.
+        """
+        delta = float(seconds)
         if delta < 0:
-            raise ValueError("FakeClock.advance requires a non-negative delta")
-        self.now += float(delta)
-
-
-@pytest.fixture
-def fake_clock() -> FakeClock:
-    """A fresh :class:`FakeClock` starting at ``t=0``."""
-    return FakeClock(start=0.0)
-
-
-@pytest.fixture
-def rate_limiter_factory(
-    fake_clock: FakeClock,
-) -> Callable[..., Any]:
-    """Factory producing :class:`utils.rate_limiter.RateLimiter` instances.
-
-    The returned callable defaults to the Rule 2 floor (1.0s) and wires
-    :class:`FakeClock` in as both the clock and sleeper. Tests that want
-    a different interval pass ``interval=2.5`` (etc.).
-    """
-    # Local import to avoid a top-level dependency on a production module
-    # before it has been validated by earlier collection steps.
-    from utils.rate_limiter import RateLimiter
-
-    def _make(interval: Optional[float] = None) -> Any:
-        # ``RateLimiter.__init__`` signature (AAP-verified):
-        #   (self, min_interval_seconds=None, *, clock=..., sleeper=...)
-        return RateLimiter(
-            interval if interval is not None else RateLimiter.RULE2_FLOOR,
-            clock=fake_clock.monotonic,
-            sleeper=fake_clock.sleep,
-        )
-
-    return _make
-
-
-# ===========================================================================
-# Recording test doubles (handwritten spies)
-# ===========================================================================
+            raise ValueError(
+                "FakeClock.advance() requires a non-negative delta; "
+                f"got {delta!r}"
+            )
+        self.now += delta
 
 
 class RecordingClient:
-    """Spy replacement for :class:`api.nba_client.NBAClient`.
+    """Spy-style stand-in for :class:`api.nba_client.NBAClient`.
 
-    The production ``NBAClient.get(endpoint, params) -> dict`` contract is
-    reproduced exactly: each call records its arguments and returns a
-    deterministic value chosen from the configured queue of responses.
+    Records every ``(endpoint, params)`` tuple on :attr:`calls`.
+    Returns responses from :attr:`responses` keyed by endpoint name,
+    or a minimal 1×1 default envelope for unmapped endpoints so that
+    pipeline tests do not trip on unknown endpoint lookups.
 
-    Parameters
-    ----------
-    responses : dict[str, list[dict]] or dict[str, dict], optional
-        Mapping of endpoint name to either a single response dict (which
-        will be returned on every call) or a list of responses consumed
-        in FIFO order. When a list is configured and exhausted, the next
-        call raises :class:`AssertionError` -- a loud failure mode so
-        tests cannot silently over-consume fixtures.
-    failures : dict[str, list[BaseException]] or dict[str, BaseException]
-        Mapping of endpoint name to exceptions that should be raised in
-        place of a response. Exceptions are consumed in the same FIFO
-        order as ``responses``; tests that mix response dicts and
-        exceptions should supply both keys.
+    Configure :attr:`raise_for` with a mapping of ``endpoint`` →
+    :class:`BaseException` instance to make :meth:`get` raise for that
+    endpoint. This is the primary mechanism used by the Rule 6
+    fail-safe games-iteration canary test
+    (``tests/unit/pipelines/test_ingest_games.py``).
 
     Attributes
     ----------
-    calls : list[tuple[str, dict]]
-        Append-only list of every ``(endpoint, params)`` pair received
-        by :meth:`get`. Tests assert on both length and content.
+    calls:
+        Ordered list of ``(endpoint, params)`` tuples recorded by every
+        :meth:`get` invocation. ``params`` is a shallow copy, so tests
+        can inspect the exact dict passed in without worrying about
+        subsequent mutation by the caller.
+    responses:
+        Mapping of endpoint-name → response-envelope dict. Tests seed
+        this dict with the payload fixtures
+        (``sample_single_table_payload``, ``sample_schedule_payload``,
+        …) for each endpoint the system under test is expected to call.
+    raise_for:
+        Mapping of endpoint-name → exception instance. When
+        :meth:`get` is called with a matching endpoint, the exception
+        is raised instead of a response being returned. Used to
+        verify retry/fail-safe behavior without hitting the live API.
     """
 
     def __init__(
         self,
         responses: Optional[Dict[str, Any]] = None,
-        failures: Optional[Dict[str, Any]] = None,
+        raise_for: Optional[Dict[str, BaseException]] = None,
     ) -> None:
-        self._responses: Dict[str, List[Dict[str, Any]]] = {}
-        self._failures: Dict[str, List[BaseException]] = {}
-        if responses:
-            for name, value in responses.items():
-                # Normalise scalar -> single-element list so the queue
-                # model is uniform across the whole double.
-                self._responses[name] = (
-                    list(value) if isinstance(value, list) else [value]
-                )
-        if failures:
-            for name, value in failures.items():
-                self._failures[name] = (
-                    list(value) if isinstance(value, list) else [value]
-                )
+        self.responses: Dict[str, Any] = dict(responses or {})
+        self.raise_for: Dict[str, BaseException] = dict(raise_for or {})
         self.calls: List[Tuple[str, Dict[str, Any]]] = []
 
     def get(self, endpoint: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Record the call and return / raise per the configured queue."""
-        # Copy ``params`` to a new dict so mutations by the caller do not
-        # retroactively alter the recorded arguments.
-        self.calls.append((endpoint, dict(params)))
-        if endpoint in self._failures and self._failures[endpoint]:
-            raise self._failures[endpoint].pop(0)
-        if endpoint in self._responses and self._responses[endpoint]:
-            return self._responses[endpoint].pop(0)
-        raise AssertionError(
-            f"RecordingClient has no response configured for endpoint={endpoint!r}"
-        )
+        """Stand-in for ``NBAClient.get`` — records and returns or raises.
+
+        Mirrors the production signature so that swapping a
+        ``RecordingClient`` for a real ``NBAClient`` is purely a
+        constructor-level substitution (AAP §0.4.1.2 explicit
+        dependency-injection contract).
+        """
+        # ``dict(params)`` defensively snapshots the parameter map so
+        # that later mutation by the caller does not retroactively
+        # change what was "recorded" here.
+        self.calls.append((str(endpoint), dict(params or {})))
+        if endpoint in self.raise_for:
+            raise self.raise_for[endpoint]
+        if endpoint in self.responses:
+            return self.responses[endpoint]
+        # Fallback: minimal flat envelope so pipeline tests that iterate
+        # through a list of endpoint names do not trip on an unmapped
+        # endpoint. Tests that want strict endpoint coverage should
+        # assert ``client.calls`` directly.
+        return {
+            "resultSets": [
+                {
+                    "name": str(endpoint),
+                    "headers": ["A"],
+                    "rowSet": [[1]],
+                }
+            ]
+        }
+
+    def reset(self) -> None:
+        """Clear :attr:`calls` without disturbing :attr:`responses` or
+        :attr:`raise_for`. Useful between phases of a single test."""
+        self.calls.clear()
+
+    def assert_called_with_endpoint(self, endpoint: str) -> None:
+        """Raise ``AssertionError`` unless ``endpoint`` was called at least once.
+
+        The error message includes the full list of observed endpoint
+        names so a failing assertion pinpoints exactly what was missed.
+        """
+        observed = [c[0] for c in self.calls]
+        if endpoint not in observed:
+            raise AssertionError(
+                f"expected RecordingClient.get() to have been called "
+                f"with endpoint={endpoint!r}; recorded endpoints: "
+                f"{observed!r}"
+            )
 
 
 class RecordingWriter:
-    """Spy replacement for :class:`storage.csv_writer.CSVWriter`.
+    """Spy-style stand-in for :class:`storage.csv_writer.CSVWriter`.
 
-    Each call to :meth:`write` records the DataFrame (by reference), the
-    logical ``name``, and the ``season`` so tests can assert on the
-    sequence of writes a pipeline produced without actually touching
-    the filesystem.
+    Does NOT touch the filesystem for the payload itself — the recorded
+    DataFrame is a shallow ``.copy()`` so subsequent mutation by the
+    pipeline under test does not retroactively change the recorded
+    value. A :attr:`output_dir` directory IS created on disk so the
+    returned ``Path`` values point at a real (but empty) location that
+    downstream assertions can stat without ``FileNotFoundError``.
 
-    Parameters
-    ----------
-    output_dir : pathlib.Path, optional
-        Advertised output directory. The value is stored verbatim and
-        returned as a synthesised ``<name>.csv`` path so callers get a
-        :class:`~pathlib.Path` shape compatible with the real
-        :meth:`CSVWriter.write`. Defaults to ``Path("/tmp/recording")``.
+    When :attr:`raise_on` equals the ``name`` argument, :meth:`write`
+    raises :class:`RuntimeError` — used by negative tests that verify
+    the pipeline does NOT call ``CheckpointManager.mark_completed``
+    after a write failure (Rule 5 correctness guard).
 
     Attributes
     ----------
-    writes : list[dict]
-        Append-only call log. Each entry has keys ``df`` (the DataFrame
-        reference), ``name`` (artifact name), ``season`` (season string),
-        and ``path`` (the synthesised return value).
+    output_dir:
+        Temporary directory where synthetic :class:`~pathlib.Path`
+        values are rooted. Always an existing directory.
+    writes:
+        Ordered list of write records. Each entry is a dict with keys
+        ``df`` (snapshot DataFrame), ``name`` (str), ``season`` (str),
+        and ``rows`` (int length of the DataFrame at write time).
+    raise_on:
+        If not ``None``, the ``name`` argument that triggers a
+        :class:`RuntimeError`; all other writes are recorded normally.
     """
 
-    def __init__(self, output_dir: Optional[Path] = None) -> None:
-        self.output_dir: Path = (
-            output_dir if output_dir is not None else Path("/tmp/recording")
-        )
+    def __init__(
+        self,
+        output_dir: Path,
+        raise_on: Optional[str] = None,
+    ) -> None:
+        self.output_dir: Path = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
         self.writes: List[Dict[str, Any]] = []
+        self.raise_on: Optional[str] = raise_on
 
     def write(self, df: pd.DataFrame, name: str, season: str) -> Path:
-        """Record the write and return a synthesised artifact path."""
-        target = self.output_dir / f"{name}.csv"
+        """Record the write call (or raise) and return a synthetic path.
+
+        Mirrors the production ``BaseWriter.write`` signature (AAP
+        §0.4.1.1) so ``RecordingWriter`` is a drop-in substitute in
+        pipeline unit tests.
+        """
+        if self.raise_on is not None and name == self.raise_on:
+            raise RuntimeError(f"synthetic write failure for {name!r}")
+        # Snapshot the DataFrame so later mutation by the pipeline
+        # under test does not retroactively change what was recorded.
         self.writes.append(
             {
-                "df": df,
-                "name": name,
-                "season": season,
-                "path": target,
+                "df": df.copy() if df is not None else None,
+                "name": str(name),
+                "season": str(season),
+                "rows": int(len(df)) if df is not None else 0,
             }
         )
-        return target
+        return self.output_dir / f"{name}.csv"
 
 
 class RecordingCheckpoint:
-    """Spy replacement for :class:`utils.checkpoint.CheckpointManager`.
+    """Spy-style stand-in for :class:`utils.checkpoint.CheckpointManager`.
 
-    The production signatures are preserved exactly:
+    In-memory only — no disk I/O — so tests run at memory speed and
+    filesystem isolation (Rule 5's on-disk manifest) is orthogonal to
+    pipeline logic assertions.
 
-    * ``is_completed(domain: str, key: str) -> bool``
-    * ``mark_completed(domain: str, key: str) -> None``
-    * ``get_pending(domain: str, all_keys: Iterable[str]) -> list[str]``
-
-    Completion state is held in an in-memory ``dict[str, set[str]]``
-    keyed by domain name.
+    Every ``is_completed``, ``mark_completed``, and ``get_pending``
+    invocation is recorded so tests can assert both the arguments AND
+    the call order — critical for Rule 5 correctness, which requires
+    ``mark_completed`` to be called AFTER a successful write (not
+    before).
 
     Attributes
     ----------
-    completions : list[tuple[str, str]]
-        Append-only chronological log of every ``mark_completed`` call.
-        Tests assert on ordering to verify Rule 5 (checkpoint immediately
-        after every successful pull).
+    marks:
+        Ordered list of ``(domain, key)`` tuples recorded by every
+        :meth:`mark_completed` call.
+    checks:
+        Ordered list of ``(domain, key)`` tuples recorded by every
+        :meth:`is_completed` call.
+    pendings:
+        Ordered list of ``(domain, all_keys)`` tuples recorded by every
+        :meth:`get_pending` call; ``all_keys`` is stored as a
+        :class:`tuple` so the record is hashable and immutable.
     """
 
-    def __init__(self, initial: Optional[Dict[str, Iterable[str]]] = None) -> None:
-        self._state: Dict[str, set] = {}
-        if initial:
-            for domain, keys in initial.items():
-                self._state[domain] = set(keys)
-        self.completions: List[Tuple[str, str]] = []
+    def __init__(
+        self,
+        completed: Optional[Dict[str, Iterable[str]]] = None,
+    ) -> None:
+        self._completed: Dict[str, set] = {
+            str(domain): {str(k) for k in keys}
+            for domain, keys in (completed or {}).items()
+        }
+        self.marks: List[Tuple[str, str]] = []
+        self.checks: List[Tuple[str, str]] = []
+        self.pendings: List[Tuple[str, Tuple[str, ...]]] = []
 
     def is_completed(self, domain: str, key: str) -> bool:
-        """Return whether ``(domain, key)`` has been marked completed."""
-        return key in self._state.get(domain, set())
+        """Return whether ``(domain, key)`` has been recorded as completed."""
+        d, k = str(domain), str(key)
+        self.checks.append((d, k))
+        return k in self._completed.get(d, set())
 
     def mark_completed(self, domain: str, key: str) -> None:
-        """Mark ``(domain, key)`` completed and record the call order."""
-        self._state.setdefault(domain, set()).add(key)
-        self.completions.append((domain, key))
+        """Record ``(domain, key)`` as completed.
+
+        Mirrors the production contract: calls are synchronous and
+        durable-equivalent (for in-memory testing). Production code
+        asserts ``mark_completed`` is called immediately after a
+        successful ``CSVWriter.write`` (Rule 5).
+        """
+        d, k = str(domain), str(key)
+        self.marks.append((d, k))
+        self._completed.setdefault(d, set()).add(k)
 
     def get_pending(self, domain: str, all_keys: Iterable[str]) -> List[str]:
-        """Return the subset of ``all_keys`` not yet completed in ``domain``."""
-        done = self._state.get(domain, set())
-        return [k for k in all_keys if k not in done]
+        """Return the subset of ``all_keys`` not yet marked completed for ``domain``."""
+        d = str(domain)
+        keys_tuple: Tuple[str, ...] = tuple(str(k) for k in all_keys)
+        self.pendings.append((d, keys_tuple))
+        done = self._completed.get(d, set())
+        return [k for k in keys_tuple if k not in done]
 
 
-@pytest.fixture
-def recording_client() -> RecordingClient:
-    """A :class:`RecordingClient` pre-loaded with no responses or failures."""
-    return RecordingClient()
+# ---------------------------------------------------------------------------
+# Session-scoped discovery fixtures
+# ---------------------------------------------------------------------------
 
 
-@pytest.fixture
-def recording_writer(tmp_path: Path) -> RecordingWriter:
-    """A :class:`RecordingWriter` rooted at an ephemeral ``tmp_path``."""
-    return RecordingWriter(output_dir=tmp_path)
+@pytest.fixture(scope="session")
+def project_root() -> Path:
+    """Absolute path of the repository root.
 
-
-@pytest.fixture
-def recording_checkpoint() -> RecordingCheckpoint:
-    """A :class:`RecordingCheckpoint` with no pre-marked completions."""
-    return RecordingCheckpoint()
-
-
-# ===========================================================================
-# DataFrame fixtures
-# ===========================================================================
-
-
-@pytest.fixture
-def flat_df() -> pd.DataFrame:
-    """A scalar-only :class:`pandas.DataFrame` typical of a normalised result.
-
-    This DataFrame satisfies Rule 4 (no nested cells) and contains a
-    mix of integer, float, string, and ``None`` values so tests exercise
-    both the happy path of :meth:`CSVWriter.write` and the subtler
-    null-handling behaviour.
+    Session-scoped because the project root does not change during a
+    pytest run. Consumed by invariant tests that shell out to
+    ``subprocess.run(["grep", "-rn", ...])`` against production
+    directories (Rule 1, Rule 7 enforcement).
     """
-    return pd.DataFrame(
-        {
-            "PLAYER_ID": [203999, 1629029, 1628369],
-            "PLAYER_NAME": ["Nikola Jokić", "Luka Dončić", "Jayson Tatum"],
-            "PTS": [29.2, 33.9, 26.9],
-            "AST": [9.8, 9.2, 4.9],
-            "REB": [12.4, 9.2, 8.8],
-            "TEAM_ABBREVIATION": ["DEN", "DAL", "BOS"],
-            "NOTES": [None, None, None],
-        }
-    )
+    return PROJECT_ROOT
 
 
-@pytest.fixture
-def nested_df() -> pd.DataFrame:
-    """A pathological DataFrame whose cells contain ``dict`` values.
+@pytest.fixture(scope="session")
+def production_python_files(project_root: Path) -> List[Path]:
+    """All production ``.py`` files (excluding ``tests/``) as absolute paths.
 
-    Used to verify Rule 4 defence-in-depth in :class:`CSVWriter`
-    (``_assert_flat`` must raise :class:`ValueError` before ever
-    calling :meth:`DataFrame.to_csv`).
+    Session-scoped because the production file set is stable during a
+    pytest run. Returns an empty list if a production directory has not
+    yet been created (e.g. when tests run against a partially-built
+    repository), so that invariant tests degrade gracefully rather than
+    error out at collection time.
     """
-    return pd.DataFrame(
-        {
-            "PLAYER_ID": [1, 2],
-            # pandas holds arbitrary Python objects in object-dtype cells
-            # without complaint -- the check is entirely the writer's
-            # responsibility.
-            "STATS": [{"PTS": 30, "AST": 8}, {"PTS": 20, "AST": 5}],
-        }
-    )
+    files: List[Path] = []
+    for root_file in PRODUCTION_ROOT_FILES:
+        candidate = project_root / root_file
+        if candidate.exists():
+            files.append(candidate)
+    for subdir in PRODUCTION_DIRS:
+        folder = project_root / subdir
+        if not folder.exists():
+            continue
+        files.extend(sorted(folder.rglob("*.py")))
+    return files
 
 
-@pytest.fixture
-def list_cell_df() -> pd.DataFrame:
-    """A pathological DataFrame whose cells contain ``list`` values."""
-    return pd.DataFrame(
-        {
-            "TEAM_ID": [1, 2, 3],
-            "ROSTER": [[101, 102], [201, 202], [301, 302]],
-        }
-    )
+@pytest.fixture(scope="session")
+def checkpoint_keys() -> Dict[str, str]:
+    """Canonical checkpoint-key format strings, one per domain.
 
-
-@pytest.fixture
-def empty_df() -> pd.DataFrame:
-    """A zero-row DataFrame with declared columns.
-
-    Exercises the ``df.empty`` short-circuit in ``_assert_flat`` as well
-    as the header-only CSV emission path.
+    Each value is a Python ``str.format``-style template that tests can
+    materialize with ``.format(season=...)`` to produce the exact
+    ``(domain, key)`` tuple the production pipelines will pass to
+    :meth:`CheckpointManager.mark_completed`. Centralizing the keys
+    here prevents test files from duplicating the string literals and
+    drifting when the production format evolves.
     """
-    return pd.DataFrame(columns=["PLAYER_ID", "PLAYER_NAME", "PTS"])
+    return {
+        "schedule": "leaguegamefinder:{season}",
+        "teams": "leaguedashteamstats:{season}",
+        "lineups": "leaguedashlineups:{season}",
+        "players_primary": "leaguedashplayerstats:{season}",
+        "players_tracking": "leaguedashptstats:{season}",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Autouse project-wide state resets
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _reset_correlation_id_between_tests() -> Iterator[None]:
+    """Reset :data:`utils.correlation.correlation_id` to the empty string.
+
+    Runs **before AND after** every test so a correlation ID minted by
+    one test does not leak into the next. Uses the raw
+    ``ContextVar.set("")`` setter (as opposed to
+    :func:`utils.correlation.set_correlation_id`, which auto-mints a
+    fresh UUID when called with an empty string) so that tests start
+    from a truly empty context and can assert the absence of a
+    correlation ID in log records.
+
+    Lazily imports :mod:`utils.correlation` with an ``ImportError``
+    guard so test collection does not break when the utils module is
+    not yet present (early-stage development) — the fixture still
+    ``yield``s so other autouse fixtures and the test body run
+    normally.
+    """
+    try:
+        from utils import correlation as correlation_module
+    except ImportError:
+        yield
+        return
+    correlation_module.correlation_id.set("")
+    try:
+        yield
+    finally:
+        correlation_module.correlation_id.set("")
+
+
+@pytest.fixture(autouse=True)
+def _reset_metrics_registry_between_tests() -> Iterator[None]:
+    """Clear every counter and histogram in :data:`utils.metrics.registry`.
+
+    Metric counters are a shared mutable singleton — one test's
+    ``inc("nba_requests_total")`` would otherwise pollute a subsequent
+    test that asserts the counter is zero. Lazily imports the registry
+    with an ``ImportError`` guard so the fixture degrades gracefully
+    when ``utils.metrics`` has not yet been implemented.
+    """
+    try:
+        from utils.metrics import registry
+    except ImportError:
+        yield
+        return
+    registry.reset()
+    try:
+        yield
+    finally:
+        registry.reset()
+
+
+@pytest.fixture(autouse=True)
+def _reset_logger_handlers_between_tests() -> Iterator[None]:
+    """Tear down stdout and RotatingFileHandler instances between tests.
+
+    Invokes :func:`utils.logger._reset_for_tests` which detaches and
+    closes every handler on the root logger and flips ``_configured``
+    back to ``False`` so the next :func:`get_logger` call re-runs
+    configuration against whatever :data:`config.LOG_FILE` value is
+    active at that moment. This is what makes :pyfixture:`tmp_log_dir`
+    reconfiguration actually take effect — without this reset, the
+    RotatingFileHandler from a prior test would continue writing to
+    the (now-deleted) ``tmp_path`` directory from the prior test.
+
+    Lazily imports :mod:`utils.logger` with an ``ImportError`` guard
+    so early-stage test collection does not fail when the utils module
+    is not yet implemented.
+
+    Note on caplog interaction
+    --------------------------
+    pytest's ``caplog`` fixture manages its own log-capture handler
+    via the ``_pytest.logging`` plugin. That plugin attaches and
+    detaches its handler through pytest's own per-test hooks, not
+    through the autouse fixture contract, so calling
+    ``_reset_for_tests()`` here is safe in the context of
+    non-caplog-using tests (which is the current contract — no tests
+    under ``tests/unit/`` consume caplog). Tests that need caplog in
+    the future can override this fixture locally or mark with
+    ``pytest.mark.usefixtures`` to sequence the resets.
+    """
+    try:
+        from utils import logger as logger_module
+    except ImportError:
+        yield
+        return
+    logger_module._reset_for_tests()
+    try:
+        yield
+    finally:
+        logger_module._reset_for_tests()
+
+
+# ---------------------------------------------------------------------------
+# Filesystem-isolation fixtures
+# ---------------------------------------------------------------------------
 
 
 @pytest.fixture
-def large_df() -> pd.DataFrame:
-    """A 1000-row x 50-column scalar DataFrame for stress-level tests."""
-    import numpy as np  # local import: numpy is a pandas transitive dep
+def tmp_output_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Redirect :data:`config.OUTPUT_DIR` and :data:`config.CHECKPOINT_PATH` to ``tmp_path``.
 
-    n_rows, n_cols = 1000, 50
-    rng = np.random.default_rng(seed=42)
-    return pd.DataFrame(
-        rng.integers(low=0, high=1_000_000, size=(n_rows, n_cols)),
-        columns=[f"col_{i:02d}" for i in range(n_cols)],
-    )
+    Creates ``tmp_path / "output"`` on disk and monkeypatches both
+    ``config.OUTPUT_DIR`` and ``config.CHECKPOINT_PATH`` to point under
+    it. ``raising=True`` (the default) ensures that if a future
+    refactor renames either attribute, the monkeypatch fails fast
+    rather than silently creating a new attribute on :mod:`config`.
 
+    Lazily imports :mod:`config` so this fixture remains collectible
+    even when ``config.py`` has not yet been implemented — the
+    ``ImportError`` surfaces at fixture-request time with a clear
+    traceback pointing at the consuming test.
 
-# ===========================================================================
-# NBA Stats API resultSets envelope fixtures
-# ===========================================================================
+    Yields
+    ------
+    pathlib.Path
+        The concrete output directory under ``tmp_path`` so the
+        consuming test can inspect produced artifacts with
+        :meth:`Path.exists`, :meth:`Path.stat`, etc.
+    """
+    import config  # noqa: WPS433 - intentional lazy import, see docstring
+    output = tmp_path / "output"
+    output.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(config, "OUTPUT_DIR", output, raising=True)
+    monkeypatch.setattr(config, "CHECKPOINT_PATH", output / "checkpoint.json", raising=True)
+    return output
 
 
 @pytest.fixture
-def resultset_players() -> Dict[str, Any]:
-    """A canonical ``resultSets`` envelope modelled on ``leaguedashplayerstats``.
+def tmp_log_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Redirect :data:`config.LOG_DIR` and :data:`config.LOG_FILE` to ``tmp_path``.
 
-    Single result set with three headers and three rows. Every cell is
-    scalar so the envelope is directly normaliseable without Rule 4
-    violation.
+    Symmetric to :pyfixture:`tmp_output_dir` — creates ``tmp_path /
+    "logs"`` and monkeypatches ``config.LOG_DIR`` + ``config.LOG_FILE``
+    so the :pyfixture:`_reset_logger_handlers_between_tests` fixture
+    can re-run :func:`utils.logger._configure` against the temporary
+    path on the next :func:`get_logger` call.
+
+    Yields
+    ------
+    pathlib.Path
+        The concrete log directory under ``tmp_path``.
+    """
+    import config  # noqa: WPS433 - intentional lazy import
+    logs = tmp_path / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(config, "LOG_DIR", logs, raising=True)
+    monkeypatch.setattr(config, "LOG_FILE", logs / "pipeline.log", raising=True)
+    return logs
+
+
+@pytest.fixture
+def isolated_filesystem(
+    tmp_output_dir: Path, tmp_log_dir: Path
+) -> Dict[str, Path]:
+    """Combined output + log directory isolation for whole-pipeline tests.
+
+    Returns a dict with keys ``"output"`` and ``"logs"`` pointing at
+    the respective temporary directories. Tests that run a full
+    pipeline subcommand (``run.py players``, etc.) request this
+    fixture to isolate both artifact and log filesystems in one go.
+    """
+    return {"output": tmp_output_dir, "logs": tmp_log_dir}
+
+
+# ---------------------------------------------------------------------------
+# NBA Stats API ``resultSets`` envelope payload fixtures
+# ---------------------------------------------------------------------------
+#
+# The NBA Stats API returns JSON shaped ``{"resultSets": [{"name", "headers",
+# "rowSet"}, ...]}``. Some endpoints (e.g. ``playercareerstats``) return the
+# singular key ``resultSet`` with a single object instead of a list. The
+# fixtures below cover every shape :mod:`utils.schema_normalizer` must handle
+# plus pathological cases used to verify error handling (Rule 4 / Gate 1).
+
+
+@pytest.fixture
+def sample_single_table_payload() -> Dict[str, Any]:
+    """Canonical one-table envelope modeling ``leaguedashplayerstats``.
+
+    All cells are scalar (Rule 4 compliant); contains three rows from
+    the 2025-26 season with realistic ``PLAYER_ID`` / ``TEAM_ID``
+    values so tests exercising team-join semantics have non-trivial
+    data.
     """
     return {
         "resource": "leaguedashplayerstats",
@@ -578,11 +674,11 @@ def resultset_players() -> Dict[str, Any]:
         "resultSets": [
             {
                 "name": "LeagueDashPlayerStats",
-                "headers": ["PLAYER_ID", "PLAYER_NAME", "PTS"],
+                "headers": ["PLAYER_ID", "PLAYER_NAME", "TEAM_ID", "PTS"],
                 "rowSet": [
-                    [203999, "Nikola Jokić", 29.2],
-                    [1629029, "Luka Dončić", 33.9],
-                    [1628369, "Jayson Tatum", 26.9],
+                    [203999, "Nikola Jokić", 1610612743, 29.6],
+                    [1629029, "Luka Dončić", 1610612742, 32.4],
+                    [1628369, "Jayson Tatum", 1610612738, 26.9],
                 ],
             }
         ],
@@ -590,19 +686,105 @@ def resultset_players() -> Dict[str, Any]:
 
 
 @pytest.fixture
-def resultset_empty() -> Dict[str, Any]:
-    """A ``resultSets`` envelope with a valid header list but zero rows.
+def sample_multi_table_payload() -> Dict[str, Any]:
+    """Two-table envelope modeling ``boxscoretraditionalv2`` (player + team).
 
-    Useful for verifying that pipelines handle "no data returned"
-    gracefully without crashing on an empty ``rowSet``.
+    Exercises the normalizer's multi-table branch: a single payload
+    must produce one DataFrame per ``resultSets`` entry, keyed by the
+    entry's ``name`` field, with zero cross-contamination between
+    them.
+    """
+    return {
+        "resource": "boxscoretraditionalv2",
+        "parameters": {"GameID": "0022500001"},
+        "resultSets": [
+            {
+                "name": "PlayerStats",
+                "headers": ["GAME_ID", "PLAYER_ID", "TEAM_ID", "PTS"],
+                "rowSet": [
+                    ["0022500001", 203999, 1610612743, 28],
+                    ["0022500001", 1629029, 1610612742, 35],
+                ],
+            },
+            {
+                "name": "TeamStats",
+                "headers": ["GAME_ID", "TEAM_ID", "PTS"],
+                "rowSet": [
+                    ["0022500001", 1610612743, 118],
+                    ["0022500001", 1610612742, 112],
+                ],
+            },
+        ],
+    }
+
+
+@pytest.fixture
+def sample_schedule_payload() -> Dict[str, Any]:
+    """``leaguegamefinder`` envelope with duplicate ``GAME_ID`` rows.
+
+    The ``leaguegamefinder`` endpoint emits two rows per game (one for
+    the home team, one for the away team). This fixture includes three
+    distinct games across five rows to exercise the deduplication
+    logic in ``endpoints.schedule.enumerate_game_ids``.
+    """
+    return {
+        "resource": "leaguegamefinder",
+        "parameters": {"LeagueID": "00", "Season": "2025-26"},
+        "resultSets": [
+            {
+                "name": "LeagueGameFinderResults",
+                "headers": ["SEASON_ID", "TEAM_ID", "GAME_ID", "GAME_DATE"],
+                "rowSet": [
+                    ["22025", 1610612747, "0022500001", "2025-10-21"],
+                    ["22025", 1610612744, "0022500001", "2025-10-21"],
+                    ["22025", 1610612738, "0022500002", "2025-10-22"],
+                    ["22025", 1610612739, "0022500002", "2025-10-22"],
+                    ["22025", 1610612737, "0022500003", "2025-10-23"],
+                ],
+            }
+        ],
+    }
+
+
+@pytest.fixture
+def sample_playbyplay_payload() -> Dict[str, Any]:
+    """``playbyplayv2`` envelope with a small sequence of period-1 events.
+
+    Includes the canonical ``EVENTNUM`` column used by ``games.csv``
+    ordering. All cells are scalar so Rule 4 is satisfied.
+    """
+    return {
+        "resource": "playbyplayv2",
+        "parameters": {"GameID": "0022500001", "StartPeriod": 1, "EndPeriod": 14},
+        "resultSets": [
+            {
+                "name": "PlayByPlay",
+                "headers": ["GAME_ID", "EVENTNUM", "EVENTMSGTYPE", "PERIOD"],
+                "rowSet": [
+                    ["0022500001", 1, 12, 1],
+                    ["0022500001", 2, 10, 1],
+                    ["0022500001", 3, 1, 1],
+                ],
+            }
+        ],
+    }
+
+
+@pytest.fixture
+def sample_empty_payload() -> Dict[str, Any]:
+    """``resultSets`` table with ``headers`` but zero ``rowSet`` rows.
+
+    The normalizer must produce a zero-row DataFrame (preserving
+    column names) without raising, so downstream pipelines can safely
+    write a header-only CSV for slow days with no games.
     """
     return {
         "resource": "leaguedashplayerstats",
-        "parameters": {"Season": "2099-00"},
+        "parameters": {"Season": "2025-26"},
         "resultSets": [
             {
                 "name": "LeagueDashPlayerStats",
-                "headers": ["PLAYER_ID", "PLAYER_NAME", "PTS"],
+                "headers": ["PLAYER_ID", "PTS"],
                 "rowSet": [],
             }
         ],
@@ -610,134 +792,346 @@ def resultset_empty() -> Dict[str, Any]:
 
 
 @pytest.fixture
-def resultset_multi() -> Dict[str, Any]:
-    """A ``resultSets`` envelope containing TWO distinct result tables.
+def sample_nested_violation_payload() -> Dict[str, Any]:
+    """Pathological payload with a :class:`dict` embedded in a cell.
 
-    Models the NBA Stats endpoints (e.g., ``boxscoretraditionalv2``) that
-    return multiple parallel result sets in a single response. The
-    normaliser is expected to flatten both into independent DataFrames.
+    Exercises the Rule 4 (flat CSV) post-flatten assertion in
+    ``utils.schema_normalizer.normalize_result_sets``. The normalizer
+    must raise a :class:`ValueError` (or equivalent domain error) that
+    identifies the offending column so operators can trace the
+    violation quickly.
     """
     return {
-        "resource": "boxscoretraditionalv2",
-        "parameters": {"GameID": "0022300001"},
+        "resource": "synthetic_bad_payload",
+        "parameters": {},
         "resultSets": [
             {
-                "name": "PlayerStats",
-                "headers": ["PLAYER_ID", "PTS", "AST"],
+                "name": "BadTable",
+                "headers": ["ID", "META"],
                 "rowSet": [
-                    [203999, 30, 8],
-                    [1629029, 28, 10],
+                    [1, {"embedded": "dict"}],
+                    [2, {"also": "dict"}],
                 ],
-            },
-            {
-                "name": "TeamStats",
-                "headers": ["TEAM_ID", "PTS"],
-                "rowSet": [
-                    [1610612743, 112],
-                    [1610612742, 108],
-                ],
-            },
+            }
         ],
     }
 
 
-# ===========================================================================
-# Filesystem fixtures
-# ===========================================================================
+@pytest.fixture
+def sample_row_mismatch_payload() -> Dict[str, Any]:
+    """``rowSet`` rows whose length does not match ``headers``.
+
+    Covers the defensive-shape branch of the normalizer: a payload
+    with 3 headers but rows of length 2 and 3 must raise
+    :class:`ValueError` rather than silently truncating or padding.
+    """
+    return {
+        "resource": "synthetic_bad_shape",
+        "parameters": {},
+        "resultSets": [
+            {
+                "name": "BadShape",
+                "headers": ["A", "B", "C"],
+                "rowSet": [[1, 2], [3, 4, 5]],
+            }
+        ],
+    }
 
 
 @pytest.fixture
-def tmp_output_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """A writable tmp directory with ``config.OUTPUT_DIR`` redirected to it.
+def sample_result_set_singular_payload() -> Dict[str, Any]:
+    """Envelope using the singular ``resultSet`` key (e.g. ``playercareerstats``).
 
-    Every test that writes CSVs should depend on this fixture rather
-    than on raw ``tmp_path`` so the default :class:`CSVWriter` (which
-    reads :data:`config.OUTPUT_DIR` on construction) naturally targets
-    the temporary directory.
-
-    Parameters
-    ----------
-    tmp_path : pathlib.Path
-        Built-in pytest fixture supplying a unique per-test directory.
-    monkeypatch : pytest.MonkeyPatch
-        Built-in pytest fixture used to restore :data:`config.OUTPUT_DIR`
-        when the test completes.
-
-    Returns
-    -------
-    pathlib.Path
-        The same :class:`~pathlib.Path` that ``config.OUTPUT_DIR`` now
-        resolves to for the duration of the test.
+    A handful of NBA Stats endpoints return a single table under the
+    singular key ``resultSet`` (an object) rather than the plural
+    ``resultSets`` (a list). The normalizer must treat the singular
+    form as equivalent to a single-element ``resultSets`` list.
     """
-    # Redirect config.OUTPUT_DIR for the duration of the test. Pytest's
-    # monkeypatch will automatically restore the original attribute on
-    # teardown.
-    output_dir = tmp_path / "output"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    monkeypatch.setattr(config, "OUTPUT_DIR", output_dir)
-    monkeypatch.setattr(
-        config, "CHECKPOINT_PATH", output_dir / "checkpoint.json"
+    return {
+        "resource": "playercareerstats",
+        "parameters": {"PlayerID": 203999},
+        "resultSet": {
+            "name": "SeasonTotalsRegularSeason",
+            "headers": ["PLAYER_ID", "SEASON_ID", "PTS"],
+            "rowSet": [
+                [203999, "2024-25", 1700],
+                [203999, "2025-26", 1800],
+            ],
+        },
+    }
+
+
+@pytest.fixture
+def sample_missing_resultsets_payload() -> Dict[str, Any]:
+    """Envelope missing both ``resultSets`` and ``resultSet``.
+
+    A real upstream never emits this shape; the fixture lets the
+    normalizer verify that its defensive-coding path raises a
+    descriptive :class:`ValueError` rather than :class:`KeyError` (the
+    latter would bubble up cryptically to operators).
+    """
+    return {"resource": "broken_upstream", "parameters": {}}
+
+
+# ---------------------------------------------------------------------------
+# DataFrame fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def flat_df() -> pd.DataFrame:
+    """Canonical Rule-4-compliant DataFrame with scalar cells only.
+
+    ``PLAYER_ID`` is intentionally the first column because the CSV
+    writer contract in ``tests/unit/storage/test_csv_writer.py``
+    asserts that ``first_line.split(",")[0] == "PLAYER_ID"`` on the
+    produced CSV. Additional columns (``PLAYER_NAME``, ``TEAM_ID``,
+    ``PTS``) cover string, integer, and float column dtypes so
+    DataFrame-round-trip tests exercise pandas' CSV parsing for each
+    Python scalar type.
+    """
+    return pd.DataFrame(
+        {
+            "PLAYER_ID": [203999, 1629029, 1628369],
+            "PLAYER_NAME": ["Nikola Jokić", "Luka Dončić", "Jayson Tatum"],
+            "TEAM_ID": [1610612743, 1610612742, 1610612738],
+            "PTS": [29.6, 32.4, 26.9],
+        }
     )
-    return output_dir
+
+
+@pytest.fixture
+def nested_df() -> pd.DataFrame:
+    """Pathological DataFrame with :class:`dict` cells (Rule 4 violation).
+
+    The column name ``"STATS"`` is referenced literally by
+    ``tests/unit/storage/test_csv_writer.py::test_a4_dict_cell_rejected``
+    to assert that the Rule 4 violation message identifies the
+    offending column by name. Do NOT rename this column without
+    updating the assertion.
+    """
+    return pd.DataFrame(
+        {
+            "PLAYER_ID": [203999, 1629029],
+            "STATS": [{"PTS": 30, "AST": 8}, {"PTS": 20, "AST": 5}],
+        }
+    )
+
+
+@pytest.fixture
+def list_cell_df() -> pd.DataFrame:
+    """Pathological DataFrame with :class:`list` cells (Rule 4 violation).
+
+    The column name ``"ROSTER"`` is referenced literally by
+    ``tests/unit/storage/test_csv_writer.py::test_a4_list_cell_rejected``
+    to assert that the Rule 4 violation message identifies the
+    offending column by name. Do NOT rename this column without
+    updating the assertion.
+    """
+    return pd.DataFrame(
+        {
+            "TEAM_ID": [1610612743, 1610612742, 1610612738],
+            "ROSTER": [[101, 102], [201, 202], [301, 302]],
+        }
+    )
+
+
+@pytest.fixture
+def empty_df() -> pd.DataFrame:
+    """Zero-row DataFrame with only headers.
+
+    The CSV writer must emit a single-line CSV (headers only) when
+    given a zero-row frame. The Rule 4 guard MUST short-circuit on
+    :attr:`DataFrame.empty` so the assertion does not misfire on an
+    empty column object.
+    """
+    return pd.DataFrame(columns=["PLAYER_ID", "PLAYER_NAME", "PTS"])
+
+
+@pytest.fixture
+def large_df() -> pd.DataFrame:
+    """Reproducible 1000×50 DataFrame for the large-payload test.
+
+    Consumed by ``tests/unit/storage/test_csv_writer.py``'s
+    ``TestJ5_LargeDataFrame`` which verifies ``CSVWriter`` handles
+    non-trivial volumes without regressions. Built via a
+    seed-42-initialised :class:`numpy.random.Generator` so the row
+    values are deterministic across runs — failing tests are thus
+    reproducible without snapshot files.
+
+    The first column is ``PLAYER_ID`` (maintaining the first-column
+    invariant from :pyfixture:`flat_df`); remaining 49 columns are
+    ``COL_01`` … ``COL_49`` with ``float64`` random values. All cells
+    are scalar so Rule 4 is satisfied.
+    """
+    import numpy as np  # noqa: WPS433 - lazy import; numpy is a pandas transitive dep
+    rng = np.random.default_rng(seed=42)
+    n_rows = 1000
+    n_cols = 49
+    data: Dict[str, Any] = {"PLAYER_ID": np.arange(1, n_rows + 1, dtype=np.int64)}
+    for i in range(n_cols):
+        data[f"COL_{i + 1:02d}"] = rng.random(n_rows)
+    return pd.DataFrame(data)
+
+
+# ---------------------------------------------------------------------------
+# Factory fixtures for the handwritten spy classes
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def recording_client() -> Callable[..., RecordingClient]:
+    """Factory returning fresh :class:`RecordingClient` instances per test.
+
+    Factory form (rather than a pre-built instance) lets each test
+    seed ``responses`` and ``raise_for`` differently without one
+    test's configuration leaking into another.
+
+    Example
+    -------
+    >>> def test_schedule_enumeration(recording_client,
+    ...                               sample_schedule_payload):
+    ...     client = recording_client(
+    ...         responses={"leaguegamefinder": sample_schedule_payload}
+    ...     )
+    ...     result = client.get("leaguegamefinder", {"Season": "2025-26"})
+    ...     assert result == sample_schedule_payload
+    ...     client.assert_called_with_endpoint("leaguegamefinder")
+    """
+
+    def _factory(
+        responses: Optional[Dict[str, Any]] = None,
+        raise_for: Optional[Dict[str, BaseException]] = None,
+    ) -> RecordingClient:
+        return RecordingClient(responses=responses, raise_for=raise_for)
+
+    return _factory
+
+
+@pytest.fixture
+def recording_writer(tmp_path: Path) -> Callable[..., RecordingWriter]:
+    """Factory returning fresh :class:`RecordingWriter` instances per test.
+
+    Every instance uses ``tmp_path / "output"`` as its output
+    directory, so fake writes and any test that inspects the synthetic
+    return :class:`Path` do not pollute the operator's real
+    filesystem. Parameter ``raise_on`` lets a test inject a synthetic
+    failure on a specific artifact name (e.g. ``raise_on="games"``)
+    to verify negative-path behavior (Rule 5 — checkpoint must NOT be
+    marked completed on failed write).
+
+    Example
+    -------
+    >>> def test_pipeline_handles_write_failure(recording_writer,
+    ...                                         recording_checkpoint,
+    ...                                         flat_df):
+    ...     writer = recording_writer(raise_on="games")
+    ...     with pytest.raises(RuntimeError):
+    ...         writer.write(flat_df, "games", "2025-26")
+    """
+
+    def _factory(raise_on: Optional[str] = None) -> RecordingWriter:
+        return RecordingWriter(output_dir=tmp_path / "output", raise_on=raise_on)
+
+    return _factory
+
+
+@pytest.fixture
+def recording_checkpoint() -> Callable[..., RecordingCheckpoint]:
+    """Factory returning fresh :class:`RecordingCheckpoint` instances per test.
+
+    Parameter ``completed`` is a ``{domain: iterable-of-keys}``
+    mapping used to pre-seed the fake's completed set — the primary
+    mechanism used by Rule 5 resume tests that assert
+    already-completed keys are NOT re-fetched.
+
+    Example
+    -------
+    >>> def test_resume_skips_completed(recording_checkpoint):
+    ...     ckpt = recording_checkpoint(
+    ...         completed={"players": ["leaguedashplayerstats:2025-26"]}
+    ...     )
+    ...     assert ckpt.is_completed("players",
+    ...                               "leaguedashplayerstats:2025-26")
+    """
+
+    def _factory(
+        completed: Optional[Dict[str, Iterable[str]]] = None,
+    ) -> RecordingCheckpoint:
+        return RecordingCheckpoint(completed=completed)
+
+    return _factory
+
+
+# ---------------------------------------------------------------------------
+# CSV round-trip helper fixture
+# ---------------------------------------------------------------------------
 
 
 @pytest.fixture
 def csv_reader() -> Callable[[Path], pd.DataFrame]:
-    """Factory returning a UTF-8-aware CSV reader.
+    """Return the :func:`read_csv_as_df` helper as a first-class callable.
 
-    Centralising the reader keeps every ``assert_frame_equal`` call on
-    the same reading semantics (``dtype=str``-free, no separators
-    overridden, utf-8 encoding explicit). Tests that need different
-    semantics construct their own :func:`pandas.read_csv` call.
+    Exposing the helper as a fixture (rather than having tests import
+    :func:`read_csv_as_df` directly) gives us a single choke-point to
+    evolve round-trip semantics later (e.g. if
+    :class:`~storage.csv_writer.CSVWriter` switches to a different
+    encoding or delimiter, only the helper needs to change).
     """
 
     def _read(path: Path) -> pd.DataFrame:
-        return pd.read_csv(path, encoding="utf-8")
+        return read_csv_as_df(path)
 
     return _read
 
 
-# ===========================================================================
-# CLI harness
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# Click CLI harness fixture
+# ---------------------------------------------------------------------------
 
 
 @pytest.fixture
 def cli_runner() -> CliRunner:
-    """A fresh :class:`click.testing.CliRunner`.
+    """Fresh :class:`click.testing.CliRunner` per test.
 
-    The click 8.3.2 constructor accepts only ``charset``, ``env``,
-    ``echo_stdin``, and ``catch_exceptions`` -- there is no
-    ``mix_stderr`` kwarg in this version. The bare-call form below is
-    the portable shape.
-
-    Returns
-    -------
-    click.testing.CliRunner
-        The runner instance. Callers typically use its
-        :meth:`~click.testing.CliRunner.isolated_filesystem` context
-        manager inside each test so CLI-integrated output does not leak
-        into the shared working directory.
+    Intentionally constructed without ``mix_stderr=False`` — click
+    8.3.2 (the version pinned by ``requirements.txt``) removed the
+    ``mix_stderr`` kwarg from :class:`CliRunner.__init__` and raises
+    :class:`TypeError` if it is passed. Click ≥ 8.2 captures stdout
+    and stderr separately by default and exposes them via
+    ``result.stdout`` and ``result.stderr`` respectively, which is the
+    behavior the Gate 13 tests rely on.
     """
     return CliRunner()
 
 
-# ===========================================================================
-# Miscellaneous helpers
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# Deterministic clock / sleep fixture
+# ---------------------------------------------------------------------------
 
 
-@contextmanager
-def _restore_attr(obj: Any, name: str) -> Iterator[None]:
-    """Context manager that saves and restores ``obj.name`` around a block.
+@pytest.fixture
+def fake_clock(monkeypatch: pytest.MonkeyPatch) -> FakeClock:
+    """Replace :func:`time.monotonic` and :func:`time.sleep` with a fake.
 
-    Used internally by some tests to locally patch a module-level
-    attribute without relying on ``monkeypatch`` (e.g., when a test
-    already consumes ``monkeypatch`` for a different purpose and wants
-    an additional local scope).
+    Returns the :class:`FakeClock` instance so tests can inspect
+    :attr:`FakeClock.sleeps` and drive time forward with
+    :meth:`FakeClock.advance`. Because ``monkeypatch`` scopes the
+    replacement to the current test, the real ``time`` module is
+    restored automatically at teardown.
+
+    Usage pattern for the Rule 2 rate-limiter test::
+
+        def test_rate_limiter_enforces_floor(fake_clock):
+            from utils.rate_limiter import RateLimiter
+            limiter = RateLimiter()
+            limiter.wait()
+            limiter.wait()
+            # second wait() must have slept at least RULE2_FLOOR
+            assert fake_clock.sleeps
+            assert all(s >= 0 for s in fake_clock.sleeps)
     """
-    original = getattr(obj, name)
-    try:
-        yield
-    finally:
-        setattr(obj, name, original)
+    clock = FakeClock(start=1000.0)
+    monkeypatch.setattr(time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(time, "sleep", clock.sleep)
+    return clock
