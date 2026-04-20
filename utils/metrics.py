@@ -691,10 +691,22 @@ class MetricsRegistry:
         ``describe_counter`` call — at the cost of the ``# HELP`` line
         being blank for that metric.
 
+        The auto-registration path goes through the same
+        :meth:`_validate_name` gate that :meth:`describe_counter` uses,
+        so metric names introduced via :meth:`inc` are subject to the
+        Prometheus naming rules exactly as if they had been explicitly
+        described. This closes the previously-latent window in which a
+        dynamically-labelled call site (for example,
+        ``registry.inc("nba_requests_total", {"endpoint": some_upstream_path})``)
+        could introduce an invalid name and cause
+        :meth:`render_prometheus` to emit malformed exposition.
+
         Parameters
         ----------
         name : str
-            The counter name. Auto-registered if unknown.
+            The counter name. Auto-registered if unknown. MUST
+            satisfy the Prometheus naming rules enforced by
+            :meth:`_validate_name`.
         labels : Optional[Dict[str, str]]
             Optional label mapping. Frozen into a sorted tuple by
             :func:`_freeze_labels` so that insertion-order-different
@@ -708,9 +720,23 @@ class MetricsRegistry:
         Raises
         ------
         ValueError
-            If ``n < 0`` (counters are monotonically non-decreasing)
-            or if ``name`` is already registered as a histogram.
+            If ``name`` violates the Prometheus naming rules
+            (enforced by :meth:`_validate_name`), if ``n < 0``
+            (counters are monotonically non-decreasing), or if
+            ``name`` is already registered as a histogram.
         """
+        # Validate BEFORE acquiring the lock so invalid names fail fast
+        # without contending for the registry mutex. This mirrors the
+        # pattern used by :meth:`describe_counter` and
+        # :meth:`describe_histogram`, giving every entry point that can
+        # introduce a new metric name a single, centralised validation
+        # gate. Without this check, auto-registration on the
+        # :meth:`inc` / :meth:`observe` path would silently accept
+        # invalid names and produce malformed Prometheus exposition
+        # (for example, a name containing ``-`` fails the
+        # ``[a-zA-Z_:][a-zA-Z0-9_:]*`` regex required by the
+        # text-exposition format).
+        self._validate_name(name)
         if n < 0:
             raise ValueError(
                 "counter increments must be non-negative (Prometheus semantics)"
@@ -747,10 +773,21 @@ class MetricsRegistry:
         :meth:`describe_histogram`, it is auto-registered with the
         default bucket layout and empty help text.
 
+        The auto-registration path goes through the same
+        :meth:`_validate_name` gate that :meth:`describe_histogram`
+        uses, so histogram names introduced via :meth:`observe` are
+        subject to the Prometheus naming rules exactly as if they
+        had been explicitly described. This closes the
+        previously-latent window in which a dynamically-labelled
+        call site could introduce an invalid name and cause
+        :meth:`render_prometheus` to emit malformed exposition.
+
         Parameters
         ----------
         name : str
-            The histogram name. Auto-registered if unknown.
+            The histogram name. Auto-registered if unknown. MUST
+            satisfy the Prometheus naming rules enforced by
+            :meth:`_validate_name`.
         value : float
             The observed value. May be negative (e.g. for
             queue-age-from-deadline metrics); negative observations
@@ -762,8 +799,19 @@ class MetricsRegistry:
         Raises
         ------
         ValueError
-            If ``name`` is already registered as a counter.
+            If ``name`` violates the Prometheus naming rules
+            (enforced by :meth:`_validate_name`) or if ``name`` is
+            already registered as a counter.
         """
+        # Validate BEFORE acquiring the lock so invalid names fail fast
+        # without contending for the registry mutex. This mirrors the
+        # pattern used by :meth:`describe_counter` and
+        # :meth:`describe_histogram`, giving every entry point that can
+        # introduce a new metric name a single, centralised validation
+        # gate. Without this check, auto-registration on the
+        # :meth:`inc` / :meth:`observe` path would silently accept
+        # invalid names and produce malformed Prometheus exposition.
+        self._validate_name(name)
         key = _freeze_labels(labels)
         with self._lock:
             hist = self._histograms.get(name)
