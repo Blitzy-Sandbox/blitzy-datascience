@@ -54,7 +54,7 @@ the :meth:`api.nba_client.NBAClient.get` call. Only safe parameter
 values are logged — never full request/response bodies.
 """
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional  # noqa: F401  (Optional reserved for future type-annotation flexibility)
 
 from api.nba_client import NBAClient
 from utils.logger import get_logger
@@ -165,7 +165,7 @@ def fetch_leaguedashplayerclutch(
     measure_type: str = "Base",
     clutch_time: str = "Last 5 Minutes",
     ahead_behind: str = "Ahead or Behind",
-    point_diff: Any = "5",
+    point_diff: str = "5",
     **kwargs: Any,
 ) -> Dict[str, Any]:
     """Fetch per-player clutch-time aggregates (players-domain variant).
@@ -201,7 +201,8 @@ def fetch_leaguedashplayerclutch(
             Behind"``. Other accepted values: ``"Behind or Tied"``,
             ``"Ahead or Tied"``.
         point_diff: Maximum point differential as a string. Defaults to
-            ``"5"``. Accepts numeric input (coerced via :func:`str`).
+            ``"5"``. Callers passing numeric input should :func:`str`-cast
+            first.
         **kwargs: Additional upstream filters applied via
             ``params.update(kwargs)`` after the base dict is built.
 
@@ -344,6 +345,8 @@ def fetch_playergamelog(
     season: str,
     season_type: str = config.DEFAULT_SEASON_TYPE,
     league_id: str = config.DEFAULT_LEAGUE_ID,
+    date_from: str = "",
+    date_to: str = "",
     **kwargs: Any,
 ) -> Dict[str, Any]:
     """Fetch the per-game log for a single player / season.
@@ -362,9 +365,14 @@ def fetch_playergamelog(
             :data:`config.DEFAULT_SEASON_TYPE` (``"Regular Season"``).
         league_id: NBA League ID. Defaults to
             :data:`config.DEFAULT_LEAGUE_ID` (``"00"``).
+        date_from: Inclusive lower-bound date filter in NBA Stats format
+            (``"MM/DD/YYYY"``). Defaults to ``""`` which applies no
+            lower bound — the NBA Stats API convention for "unfiltered"
+            is the literal empty string, not the absence of the key.
+        date_to: Inclusive upper-bound date filter in NBA Stats format
+            (``"MM/DD/YYYY"``). Defaults to ``""`` (no upper bound).
         **kwargs: Additional upstream filters applied via
             ``params.update(kwargs)`` after the base dict is built.
-            Recognized filters include ``DateFrom`` and ``DateTo``.
 
     Returns:
         Raw JSON envelope with the ``PlayerGameLog`` result-set.
@@ -379,8 +387,8 @@ def fetch_playergamelog(
         "Season": season,
         "SeasonType": season_type,
         "LeagueID": league_id,
-        "DateFrom": "",
-        "DateTo": "",
+        "DateFrom": date_from,
+        "DateTo": date_to,
     }
     params.update(kwargs)
     logger.debug(
@@ -395,10 +403,10 @@ def fetch_playergamelog(
 def fetch_leaguedashptstats(
     client: NBAClient,
     season: str,
-    pt_measure_type: str,
     season_type: str = config.DEFAULT_SEASON_TYPE,
     league_id: str = config.DEFAULT_LEAGUE_ID,
     per_mode: str = "PerGame",
+    pt_measure_type: str = "SpeedDistance",
     player_or_team: str = "Player",
     **kwargs: Any,
 ) -> Dict[str, Any]:
@@ -412,13 +420,15 @@ def fetch_leaguedashptstats(
     Unlike the other four Players wrappers, ``leaguedashptstats``
     requires TWO extra distinguishing parameters:
 
-    * ``PtMeasureType`` (REQUIRED — no default) — selects the tracking
-      family returned by the response. The 12 accepted values are:
-      ``"SpeedDistance"``, ``"Rebounding"``, ``"Possessions"``,
-      ``"CatchShoot"``, ``"PullUpShot"``, ``"Defense"``, ``"Drives"``,
-      ``"Passing"``, ``"ElbowTouch"``, ``"PostTouch"``, ``"PaintTouch"``,
+    * ``PtMeasureType`` — selects the tracking family returned by the
+      response. The 12 accepted values are: ``"SpeedDistance"``,
+      ``"Rebounding"``, ``"Possessions"``, ``"CatchShoot"``,
+      ``"PullUpShot"``, ``"Defense"``, ``"Drives"``, ``"Passing"``,
+      ``"ElbowTouch"``, ``"PostTouch"``, ``"PaintTouch"``,
       ``"Efficiency"``. Each value produces a different column set in
-      the response.
+      the response. Defaults to ``"SpeedDistance"`` — the most
+      commonly-useful tracking metric set; callers that need richer
+      ``player_tracking.csv`` coverage iterate over every value.
     * ``PlayerOrTeam`` — ``"Player"`` (default, per-player rows) or
       ``"Team"`` (per-team rows). The pipeline conventionally requests
       ``"Player"`` to populate ``player_tracking.csv``; a future
@@ -428,14 +438,14 @@ def fetch_leaguedashptstats(
     Args:
         client: Shared :class:`api.nba_client.NBAClient` instance.
         season: Season string in NBA format, e.g. ``"2025-26"``.
-        pt_measure_type: REQUIRED tracking family selector. See the
-            list above for the 12 accepted values.
         season_type: Season type filter. Defaults to
             :data:`config.DEFAULT_SEASON_TYPE` (``"Regular Season"``).
         league_id: NBA League ID. Defaults to
             :data:`config.DEFAULT_LEAGUE_ID` (``"00"``).
         per_mode: Normalization mode. Defaults to ``"PerGame"``. Other
             accepted value: ``"Totals"``.
+        pt_measure_type: Tracking family selector. Defaults to
+            ``"SpeedDistance"``. See the 12 accepted values listed above.
         player_or_team: ``"Player"`` (default) or ``"Team"``.
         **kwargs: Additional upstream filters applied via
             ``params.update(kwargs)`` after the base dict is built.
