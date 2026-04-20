@@ -1,6 +1,17 @@
+# NBA Data Ingestion Pipeline — pinned dependencies
+# Runtime packages power the pipeline itself. Development packages support
+# the Gate 2 (lint) and Gate 10 (test) validation steps.
+#
+# Upper bounds are set to the next major version so `pip install` stays
+# reproducible across minor upgrades. Re-pin when a new major version of
+# any package ships.
+
+# Runtime dependencies
 requests>=2.31,<3
 pandas>=2.0,<3
 click>=8.0,<9
 tenacity>=8.0,<9
+
+# Development dependencies
 pytest>=7.0
 flake8>=6.0
