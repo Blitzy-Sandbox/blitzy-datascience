@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import logging
 import logging.handlers
+import sys
 import threading
 from typing import Any, Optional  # noqa: F401  (Optional reserved for future type-annotation flexibility)
 
@@ -233,8 +234,13 @@ def _configure() -> None:
         )
 
         # 1) Standard-output handler — observable during interactive
-        #    runs and captured by CI log collectors.
-        stream_handler = logging.StreamHandler()
+        #    runs and captured by CI log collectors. Explicitly bind to
+        #    ``sys.stdout`` so that operators tailing stdout see records
+        #    and stdout/stderr log-capture policies classify them
+        #    correctly (the default ``StreamHandler()`` stream is
+        #    ``sys.stderr``, which contradicts the module-level contract
+        #    documented above and in ``docs/OBSERVABILITY.md``).
+        stream_handler = logging.StreamHandler(sys.stdout)
         stream_handler.setFormatter(formatter)
         stream_handler.setLevel(level)
         root.addHandler(stream_handler)

@@ -473,9 +473,15 @@ class TestRetryPredicate:
         assert metrics_module.registry.get_counter_value(
             "nba_retries_total", {"endpoint": f"endpoint_d5_{status}"}
         ) == 0.0
-        # Exactly one failure counter increment
+        # Exactly one failure counter increment. The ``reason`` label is
+        # required by the :file:`docs/OBSERVABILITY.md` metrics-catalog
+        # contract (and the dashboard triage queries in
+        # :file:`docs/dashboards/operator_dashboard.md`). A non-429 4xx
+        # HTTPError classifies as ``http_4xx_non_429`` per the taxonomy
+        # implemented in :meth:`api.nba_client.NBAClient.get`.
         assert metrics_module.registry.get_counter_value(
-            "nba_request_failures_total", {"endpoint": f"endpoint_d5_{status}"}
+            "nba_request_failures_total",
+            {"endpoint": f"endpoint_d5_{status}", "reason": "http_4xx_non_429"},
         ) == 1.0
         # The status code is attached to the raised HTTPError
         assert exc_info.value.response is not None
@@ -514,8 +520,14 @@ class TestRetryPredicate:
         assert metrics_module.registry.get_counter_value(
             "nba_retries_total", {"endpoint": "endpoint_d6"}
         ) == float(config.RETRY_ATTEMPTS - 1)
+        # Per :file:`docs/OBSERVABILITY.md` metrics-catalog contract, a
+        # terminal :class:`requests.exceptions.ConnectionError` is bucketed
+        # under the ``timeout`` reason (transport-level stall/failure),
+        # matching the classification in
+        # :meth:`api.nba_client.NBAClient.get`.
         assert metrics_module.registry.get_counter_value(
-            "nba_request_failures_total", {"endpoint": "endpoint_d6"}
+            "nba_request_failures_total",
+            {"endpoint": "endpoint_d6", "reason": "timeout"},
         ) == 1.0
 
     # ---- D.7: non-RequestException exceptions are not retried ----
@@ -769,7 +781,9 @@ class TestMetricsIntegration:
         ``nba_request_failures_total`` exactly once (the except
         RequestException branch in ``get()`` runs even for non-retried
         HTTPErrors because the 4xx branch raises HTTPError — a
-        RequestException subclass).
+        RequestException subclass). Per :file:`docs/OBSERVABILITY.md`
+        metrics-catalog contract, the ``reason`` label must be
+        ``http_4xx_non_429`` for a terminal HTTP 403.
         """
         client, _ = _make_client()
         with patch("tenacity.nap.time.sleep"):
@@ -779,7 +793,8 @@ class TestMetricsIntegration:
                 with pytest.raises(HTTPError):
                     client.get("endpoint_403_fail", {})
         assert metrics_module.registry.get_counter_value(
-            "nba_request_failures_total", {"endpoint": "endpoint_403_fail"}
+            "nba_request_failures_total",
+            {"endpoint": "endpoint_403_fail", "reason": "http_4xx_non_429"},
         ) == 1.0
 
 

@@ -154,11 +154,29 @@ def _retry_log_before_sleep(retry_state: RetryCallState) -> None:
     # cached by name and only the thin :class:`CorrelationAdapter` wrapper
     # is reconstructed. This is safe and inexpensive inside a retry path.
     callback_logger = get_logger("nba_client")
+    # Log-hygiene: emit ONLY the exception class name and (when available)
+    # the upstream HTTP status code. Formatting ``exc`` directly via
+    # ``%s`` would invoke :meth:`BaseException.__str__`, which for
+    # :class:`requests.HTTPError` / :class:`Timeout` embeds the full URL
+    # — including any query-string parameters — and thereby bypasses the
+    # param-key-only safeguard applied in :meth:`NBAClient._request`'s
+    # DEBUG log. No secrets live in NBA Stats query parameters today, but
+    # this logging pattern is intentionally conservative so that adding
+    # an authenticated endpoint in future (or including PII-adjacent
+    # query values) never introduces a leak regression.
+    exc_class = type(exc).__name__ if exc is not None else "n/a"
+    exc_response = getattr(exc, "response", None) if exc is not None else None
+    status_code = (
+        getattr(exc_response, "status_code", "n/a")
+        if exc_response is not None
+        else "n/a"
+    )
     callback_logger.warning(
-        "NBAClient retrying endpoint=%s attempt=%s error=%s",
+        "NBAClient retrying endpoint=%s attempt=%s exc_class=%s status=%s",
         endpoint,
         retry_state.attempt_number,
-        exc,
+        exc_class,
+        status_code,
     )
 
 
@@ -277,11 +295,22 @@ class NBAClient:
     # -----------------------------------------------------------------
     def __init__(
         self,
+        *,
         rate_limiter: Optional[RateLimiter] = None,
         logger: Optional[logging.LoggerAdapter] = None,
         metrics: Any = None,
     ) -> None:
         """Initialize the HTTP client and its collaborators.
+
+        All three collaborator parameters are **keyword-only** (note the
+        bare ``*`` separator in the signature). This is a deliberate
+        architectural guardrail: pipeline and test callers instantiate
+        :class:`NBAClient` via ``NBAClient(rate_limiter=..., logger=...,
+        metrics=...)`` exclusively, eliminating an entire class of silent
+        argument-reorder regressions (e.g. ``NBAClient(logger,
+        rate_limiter, metrics)`` mis-binding the logger as the rate
+        limiter) that would otherwise slip past the
+        :class:`RecordingClient` spy used throughout the test suite.
 
         Parameters
         ----------
@@ -363,6 +392,11 @@ class NBAClient:
 
         Raises
         ------
+        TypeError
+            If ``endpoint`` is not a non-empty :class:`str`, or if
+            ``params`` is not a :class:`dict`. Raised synchronously at
+            the trust boundary before any rate-limit spacing, metrics,
+            or HTTP activity.
         requests.exceptions.HTTPError
             On a non-2xx final response after retry exhaustion.
         requests.exceptions.RequestException
@@ -371,13 +405,41 @@ class NBAClient:
             :class:`~requests.exceptions.ConnectionError` that persists
             across all attempts).
         """
+        # --- Trust-boundary input validation -----------------------------------
+        # :meth:`get` is the trust boundary between untrusted callers
+        # (endpoint wrappers invoked from CLI commands and tests) and the
+        # upstream HTTP transport. Validate the *kind* of each argument
+        # here so that a mis-typed caller fails fast with an explicit
+        # :class:`TypeError` at the boundary, rather than surfacing a
+        # cryptic ``TypeError: unsupported operand type(s) for +`` during
+        # URL concatenation (when ``endpoint is None``) or a misleading
+        # upstream error from :mod:`requests` (when ``params is None``
+        # silently passes through to :meth:`requests.Session.get` as
+        # "no params"). This is the single enforcement point for CWE-20
+        # (Improper Input Validation) in the transport layer; downstream
+        # helpers assume well-typed inputs. Crucially, validation runs
+        # BEFORE :meth:`RateLimiter.wait` so an ill-formed caller does
+        # not burn a rate-limit budget slot while we sleep.
+        if not isinstance(endpoint, str) or not endpoint:
+            raise TypeError(
+                "endpoint must be a non-empty str; "
+                f"got {type(endpoint).__name__!r} ({endpoint!r})"
+            )
+        if not isinstance(params, dict):
+            raise TypeError(
+                "params must be a dict (empty dict is permitted); "
+                f"got {type(params).__name__!r}"
+            )
+
         # --- Rule 2 enforcement -------------------------------------------------
-        # The rate-limit wait MUST be the first operational statement in
-        # ``get``. Placing it *outside* the retry loop is deliberate: the
-        # retry loop already supplies exponential backoff between attempts
-        # of the *same* request (via ``wait_exponential``), whereas this
-        # floor spaces *distinct* requests so that, even after retries, we
-        # never exceed the upstream rate budget.
+        # The rate-limit wait MUST be the first outbound-I/O statement in
+        # ``get`` — it may be preceded only by the trust-boundary
+        # argument validation above. Placing it *outside* the retry loop
+        # is deliberate: the retry loop already supplies exponential
+        # backoff between attempts of the *same* request (via
+        # ``wait_exponential``), whereas this floor spaces *distinct*
+        # requests so that, even after retries, we never exceed the
+        # upstream rate budget.
         self._rate_limiter.wait()
 
         # --- Observability: attempt counter ------------------------------------
@@ -397,7 +459,7 @@ class NBAClient:
         try:
             payload = self._request(endpoint, params)
             return payload
-        except RequestException:
+        except RequestException as exc:
             # Retry has been exhausted (tenacity raised the original
             # exception via ``reraise=True``). Count the final failure and
             # re-raise unchanged so callers can ``except HTTPError`` /
@@ -406,11 +468,48 @@ class NBAClient:
             # :func:`_retry_log_before_sleep`; at this terminal boundary
             # we emit ERROR without a traceback (``.error`` rather than
             # ``.exception``) to avoid duplicating stack traces.
+            #
+            # Classify the terminal failure into a coarse ``reason`` label
+            # per the :file:`docs/OBSERVABILITY.md` metrics-catalog
+            # contract so dashboard triage queries (filtered by ``reason``
+            # to answer "which failure mode dominates this endpoint?")
+            # return populated series. The taxonomy is closed and aligns
+            # with the retry predicate's transient classes:
+            #
+            #   * ``timeout``           — :class:`requests.exceptions.Timeout`
+            #                             OR :class:`requests.exceptions.ConnectionError`
+            #                             (transport-level stall/failure).
+            #   * ``http_5xx``          — server-side error;
+            #                             :class:`HTTPError` with a response
+            #                             whose ``status_code`` is ``>=500``.
+            #   * ``http_4xx_non_429``  — any remaining client-side failure
+            #                             (non-429 4xx, or an unclassified
+            #                             :class:`RequestException` subclass).
+            #                             A persistent 429 is retried to
+            #                             exhaustion and falls into this
+            #                             bucket if it surfaces here — the
+            #                             bucket is indistinguishable from
+            #                             any other permanent 4xx at this
+            #                             boundary, which matches upstream
+            #                             semantics.
+            if isinstance(exc, (Timeout, RequestsConnectionError)):
+                reason = "timeout"
+            elif (
+                isinstance(exc, HTTPError)
+                and exc.response is not None
+                and exc.response.status_code >= 500
+            ):
+                reason = "http_5xx"
+            else:
+                reason = "http_4xx_non_429"
             self._metrics.inc(
-                "nba_request_failures_total", {"endpoint": endpoint}
+                "nba_request_failures_total",
+                {"endpoint": endpoint, "reason": reason},
             )
             self._logger.error(
-                "NBAClient request exhausted retries endpoint=%s", endpoint
+                "NBAClient request exhausted retries endpoint=%s reason=%s",
+                endpoint,
+                reason,
             )
             raise
         finally:
