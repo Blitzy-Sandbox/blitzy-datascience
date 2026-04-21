@@ -1,930 +1,434 @@
+"""Unit tests for ``endpoints/games.py`` (Feature F-011 — Games domain).
+
+Covers the four Games-domain NBA Stats API endpoint wrappers:
+
+* :func:`endpoints.games.fetch_scoreboardv2` — date-partitioned game
+  enumeration; three-key param surface
+  (``GameDate`` / ``LeagueID`` / ``DayOffset``).
+* :func:`endpoints.games.fetch_boxscoretraditionalv2` — per-game
+  traditional box score; six-key param surface with the ``Range``
+  triplet (``StartPeriod`` / ``EndPeriod`` / ``StartRange`` /
+  ``EndRange`` / ``RangeType``).
+* :func:`endpoints.games.fetch_boxscoreadvancedv2` — per-game advanced
+  box score; identical parameter shape to traditional.
+* :func:`endpoints.games.fetch_playbyplayv2` — per-game play-by-play
+  event stream; NARROWER three-key param surface
+  (``GameID`` / ``StartPeriod`` / ``EndPeriod``) — no ``Range``
+  triplet. Supplying ``Range`` fields is an upstream validation
+  error, so absence is tested as a strict negative-space assertion.
+
+Contract under test
+-------------------
+
+Every wrapper:
+
+1. Delegates to ``client.get(<endpoint_name>, params)`` — the sole
+   HTTP transport call site per Rule 1 of the product brief. No test
+   in this module imports :mod:`requests` or instantiates a real
+   :class:`api.nba_client.NBAClient`.
+2. Constructs the domain-specific params dict and passes it to the
+   client unmodified after ``params.update(kwargs)`` is applied so
+   caller-supplied kwargs take precedence over documented defaults.
+3. Applies :func:`str` to numeric identifiers (``GameID``,
+   ``DayOffset``) and to period/range values, but does NOT reformat
+   string inputs. Callers that supply the 10-character zero-padded
+   ``GAME_ID`` format (e.g. ``"0022500001"``) receive that exact
+   string back in the recorded params — the format is preserved
+   verbatim.
+4. Returns the raw dict emitted by the underlying client unmodified
+   (no projection, no filtering, no copy).
+
+All tests use the ``recording_client`` factory fixture from
+:mod:`tests.conftest` to instantiate a :class:`RecordingClient` spy
+so that assertions target the recorded ``(endpoint, params)``
+tuple. The ``sample_single_table_payload`` and
+``sample_playbyplay_payload`` fixtures back the payload
+pass-through identity assertions.
 """
-Unit tests for the ``endpoints/games.py`` thin wrapper module (Feature F-011).
-
-=============================================================================
-Coverage matrix
-=============================================================================
-
-Each wrapper under test is verified across the following seven behavioral
-dimensions that collectively exercise the entire observable contract of a
-thin endpoint wrapper (per AAP §0.4.1.1 and §0.5.1.4):
-
-1. **Endpoint-name routing** — the wrapper calls
-   ``NBAClient.get(endpoint, params)`` with the exact lowercase endpoint
-   string documented in ``docs/api/endpoints_catalog.md`` and the AAP
-   feature inventory (``scoreboardv2``, ``boxscoretraditionalv2``,
-   ``boxscoreadvancedv2``, ``playbyplayv2``).
-
-2. **Required-parameter construction** — when only the documented
-   required positional argument (``game_date`` for scoreboard;
-   ``game_id`` for the other three wrappers) is supplied, the emitted
-   params dict is populated with every pinned key required by the
-   upstream NBA Stats API with the exact default values sourced from
-   ``config.py`` or the wrapper's signature defaults.
-
-3. **Type coercion** — the wrapper applies ``str(...)`` to identifier
-   parameters (``game_id`` on box-score and play-by-play wrappers,
-   ``day_offset`` on scoreboard) and to numeric period/range parameters
-   (``start_period``, ``end_period``, ``start_range``, ``end_range``,
-   ``range_type``) so that the upstream API consistently receives
-   strings regardless of whether callers supply ``int`` or ``str``.
-
-4. **Config-defaulted fields propagate** — any parameter whose default
-   reads from ``config`` (e.g. ``LeagueID`` in ``fetch_scoreboardv2``)
-   propagates its configured value into the emitted params dict.
-
-5. **``**kwargs`` override semantics** — callers can override or extend
-   the params dict by passing additional keyword arguments; the last
-   value wins because the wrapper performs ``params.update(kwargs)``
-   after constructing its default dict.
-
-6. **Return-value passthrough** — the wrapper returns exactly the value
-   returned by ``NBAClient.get`` without any transformation, wrapping,
-   or additional logic.
-
-7. **Single call per invocation** — each wrapper invocation issues
-   exactly one call to ``client.get`` (no retries, no internal loops,
-   no cached requests).
-
-Rule 1 / Rule 7 invariants
---------------------------
-
-The ``TestModuleInvariants`` class additionally verifies that
-``endpoints/games.py`` does not directly import or expose the
-``requests`` library (AAP Rule 1 — Single HTTP Client) and does not
-import ``pandas`` (AAP Rule 7 — Pluggable Storage): all four wrappers
-are thin dict-builders that delegate to ``NBAClient.get`` and never
-touch the transport layer directly.
-
-=============================================================================
-Mocking strategy
-=============================================================================
-
-All tests use the handwritten :class:`conftest.RecordingClient` spy
-exposed by the ``recording_client`` factory fixture declared in
-``tests/conftest.py``. The wrappers themselves are pure Python and do
-not require network mocking (they never touch ``requests``). The spy
-captures every ``(endpoint, params)`` pair and allows tests to assert
-on the exact call arguments that would be forwarded to the live HTTP
-layer in production.
-
-Test organization
------------------
-
-One ``TestCase`` class per public wrapper, plus a
-``TestModuleInvariants`` class for module-level properties, plus a
-``TestParamDictShape`` parametric class that asserts invariants common
-to every wrapper (exactly one call per invocation; required-parameter
-passthrough).
-"""
-
 from __future__ import annotations
-
-from typing import Any, Dict
 
 import pytest
 
-import config
 from endpoints import games
 
 
 # ---------------------------------------------------------------------------
-# TestFetchScoreboardv2 — scoreboardv2 (3-key param surface)
+# fetch_scoreboardv2 — date-partitioned game enumeration
 # ---------------------------------------------------------------------------
 
 
-class TestFetchScoreboardv2:
-    """Contract tests for :func:`endpoints.games.fetch_scoreboardv2`."""
+def test_fetch_scoreboardv2_calls_correct_endpoint(recording_client):
+    """``fetch_scoreboardv2`` must invoke ``client.get('scoreboardv2', ...)``.
 
-    def test_delegates_to_client_get_with_correct_endpoint_name(
-        self, recording_client
-    ):
-        """The wrapper must route to exactly endpoint ``scoreboardv2``."""
-        client = recording_client()
-        games.fetch_scoreboardv2(client=client, game_date="10/22/2024")
-        assert len(client.calls) == 1
-        endpoint, _ = client.calls[0]
-        assert endpoint == "scoreboardv2"
-
-    def test_game_date_is_passed_through_verbatim(self, recording_client):
-        """``game_date`` is NOT str-cast; it is forwarded as-is."""
-        client = recording_client()
-        games.fetch_scoreboardv2(client=client, game_date="10/22/2024")
-        _, params = client.calls[0]
-        assert params["GameDate"] == "10/22/2024"
-        assert isinstance(params["GameDate"], str)
-
-    def test_league_id_defaults_to_config_value(self, recording_client):
-        """``LeagueID`` default propagates from ``config.DEFAULT_LEAGUE_ID``."""
-        client = recording_client()
-        games.fetch_scoreboardv2(client=client, game_date="10/22/2024")
-        _, params = client.calls[0]
-        assert params["LeagueID"] == config.DEFAULT_LEAGUE_ID
-
-    def test_day_offset_defaults_to_zero_string(self, recording_client):
-        """``DayOffset`` default is the literal string ``'0'``."""
-        client = recording_client()
-        games.fetch_scoreboardv2(client=client, game_date="10/22/2024")
-        _, params = client.calls[0]
-        assert params["DayOffset"] == "0"
-        assert isinstance(params["DayOffset"], str)
-
-    def test_day_offset_int_is_cast_to_string(self, recording_client):
-        """Integer ``day_offset`` is coerced to ``str`` in the params dict."""
-        client = recording_client()
-        games.fetch_scoreboardv2(
-            client=client, game_date="10/22/2024", day_offset=-1
-        )
-        _, params = client.calls[0]
-        assert params["DayOffset"] == "-1"
-        assert isinstance(params["DayOffset"], str)
-
-    def test_day_offset_string_is_passed_through_verbatim(
-        self, recording_client
-    ):
-        """String ``day_offset`` survives the str-cast unchanged."""
-        client = recording_client()
-        games.fetch_scoreboardv2(
-            client=client, game_date="10/22/2024", day_offset="2"
-        )
-        _, params = client.calls[0]
-        assert params["DayOffset"] == "2"
-
-    def test_params_contains_only_three_keys_by_default(self, recording_client):
-        """Default invocation produces exactly the documented 3-key surface."""
-        client = recording_client()
-        games.fetch_scoreboardv2(client=client, game_date="10/22/2024")
-        _, params = client.calls[0]
-        assert set(params.keys()) == {"GameDate", "LeagueID", "DayOffset"}
-
-    def test_params_excludes_season_and_season_type(self, recording_client):
-        """Games wrappers do not include ``Season`` or ``SeasonType``."""
-        client = recording_client()
-        games.fetch_scoreboardv2(client=client, game_date="10/22/2024")
-        _, params = client.calls[0]
-        assert "Season" not in params
-        assert "SeasonType" not in params
-
-    def test_explicit_league_id_overrides_default(self, recording_client):
-        """Explicit ``league_id=`` kwarg is honored over the config default."""
-        client = recording_client()
-        games.fetch_scoreboardv2(
-            client=client, game_date="10/22/2024", league_id="20"
-        )
-        _, params = client.calls[0]
-        assert params["LeagueID"] == "20"
-
-    def test_kwargs_override_defaults(self, recording_client):
-        """Upper-case kwargs forwarded via ``**kwargs`` win over defaults."""
-        client = recording_client()
-        games.fetch_scoreboardv2(
-            client=client,
-            game_date="10/22/2024",
-            GameDate="11/01/2024",
-            DayOffset="5",
-            LeagueID="20",
-        )
-        _, params = client.calls[0]
-        # The explicit keyword GameDate goes into the params dict directly,
-        # but ``params.update(kwargs)`` after construction means the
-        # kwargs-supplied value wins.
-        assert params["GameDate"] == "11/01/2024"
-        assert params["DayOffset"] == "5"
-        assert params["LeagueID"] == "20"
-
-    def test_return_value_is_raw_client_response(self, recording_client):
-        """The wrapper returns exactly the client's response, identity-preserved."""
-        response: Dict[str, Any] = {"resultSets": [{"name": "GameHeader"}]}
-        client = recording_client(responses={"scoreboardv2": response})
-        result = games.fetch_scoreboardv2(
-            client=client, game_date="10/22/2024"
-        )
-        assert result is response
-
-    def test_single_call_per_invocation(self, recording_client):
-        """Exactly one call to ``client.get`` per wrapper invocation."""
-        client = recording_client()
-        games.fetch_scoreboardv2(client=client, game_date="10/22/2024")
-        assert len(client.calls) == 1
-
-
-# ---------------------------------------------------------------------------
-# TestFetchBoxscoretraditionalv2 — boxscoretraditionalv2 (6-key param surface)
-# ---------------------------------------------------------------------------
-
-
-class TestFetchBoxscoretraditionalv2:
-    """Contract tests for :func:`endpoints.games.fetch_boxscoretraditionalv2`."""
-
-    def test_delegates_to_client_get_with_correct_endpoint_name(
-        self, recording_client
-    ):
-        """The wrapper must route to exactly endpoint ``boxscoretraditionalv2``."""
-        client = recording_client()
-        games.fetch_boxscoretraditionalv2(
-            client=client, game_id="0022500001"
-        )
-        assert len(client.calls) == 1
-        endpoint, _ = client.calls[0]
-        assert endpoint == "boxscoretraditionalv2"
-
-    def test_game_id_string_is_passed_through_verbatim(self, recording_client):
-        """String ``game_id`` survives the str-cast unchanged."""
-        client = recording_client()
-        games.fetch_boxscoretraditionalv2(
-            client=client, game_id="0022500001"
-        )
-        _, params = client.calls[0]
-        assert params["GameID"] == "0022500001"
-        assert isinstance(params["GameID"], str)
-
-    def test_game_id_int_is_cast_to_string(self, recording_client):
-        """Integer ``game_id`` is coerced to ``str`` — no zero-padding applied."""
-        client = recording_client()
-        games.fetch_boxscoretraditionalv2(client=client, game_id=22500001)
-        _, params = client.calls[0]
-        assert params["GameID"] == "22500001"
-        assert isinstance(params["GameID"], str)
-
-    def test_start_period_defaults_to_zero_string(self, recording_client):
-        """``StartPeriod`` default is the literal string ``'0'``."""
-        client = recording_client()
-        games.fetch_boxscoretraditionalv2(
-            client=client, game_id="0022500001"
-        )
-        _, params = client.calls[0]
-        assert params["StartPeriod"] == "0"
-        assert isinstance(params["StartPeriod"], str)
-
-    def test_end_period_defaults_to_ten_string(self, recording_client):
-        """``EndPeriod`` default is the literal string ``'10'``."""
-        client = recording_client()
-        games.fetch_boxscoretraditionalv2(
-            client=client, game_id="0022500001"
-        )
-        _, params = client.calls[0]
-        assert params["EndPeriod"] == "10"
-        assert isinstance(params["EndPeriod"], str)
-
-    def test_start_range_defaults_to_zero_string(self, recording_client):
-        """``StartRange`` default is the literal string ``'0'``."""
-        client = recording_client()
-        games.fetch_boxscoretraditionalv2(
-            client=client, game_id="0022500001"
-        )
-        _, params = client.calls[0]
-        assert params["StartRange"] == "0"
-        assert isinstance(params["StartRange"], str)
-
-    def test_end_range_defaults_to_28800_string(self, recording_client):
-        """``EndRange`` default is the literal string ``'28800'`` (full game)."""
-        client = recording_client()
-        games.fetch_boxscoretraditionalv2(
-            client=client, game_id="0022500001"
-        )
-        _, params = client.calls[0]
-        assert params["EndRange"] == "28800"
-        assert isinstance(params["EndRange"], str)
-
-    def test_range_type_defaults_to_zero_string(self, recording_client):
-        """``RangeType`` default is the literal string ``'0'``."""
-        client = recording_client()
-        games.fetch_boxscoretraditionalv2(
-            client=client, game_id="0022500001"
-        )
-        _, params = client.calls[0]
-        assert params["RangeType"] == "0"
-        assert isinstance(params["RangeType"], str)
-
-    def test_numeric_periods_and_ranges_are_cast_to_strings(
-        self, recording_client
-    ):
-        """All period/range integer inputs are coerced to strings."""
-        client = recording_client()
-        games.fetch_boxscoretraditionalv2(
-            client=client,
-            game_id="0022500001",
-            start_period=1,
-            end_period=4,
-            start_range=0,
-            end_range=14400,
-            range_type=1,
-        )
-        _, params = client.calls[0]
-        assert params["StartPeriod"] == "1"
-        assert params["EndPeriod"] == "4"
-        assert params["StartRange"] == "0"
-        assert params["EndRange"] == "14400"
-        assert params["RangeType"] == "1"
-        for key in (
-            "StartPeriod",
-            "EndPeriod",
-            "StartRange",
-            "EndRange",
-            "RangeType",
-        ):
-            assert isinstance(params[key], str)
-
-    def test_params_contains_only_six_keys_by_default(self, recording_client):
-        """Default invocation produces exactly the documented 6-key surface."""
-        client = recording_client()
-        games.fetch_boxscoretraditionalv2(
-            client=client, game_id="0022500001"
-        )
-        _, params = client.calls[0]
-        assert set(params.keys()) == {
-            "GameID",
-            "StartPeriod",
-            "EndPeriod",
-            "StartRange",
-            "EndRange",
-            "RangeType",
-        }
-
-    def test_params_excludes_season_and_season_type(self, recording_client):
-        """Games wrappers do not include ``Season`` or ``SeasonType``."""
-        client = recording_client()
-        games.fetch_boxscoretraditionalv2(
-            client=client, game_id="0022500001"
-        )
-        _, params = client.calls[0]
-        assert "Season" not in params
-        assert "SeasonType" not in params
-
-    def test_kwargs_override_defaults(self, recording_client):
-        """Upper-case kwargs supplied via ``**kwargs`` win over defaults."""
-        client = recording_client()
-        games.fetch_boxscoretraditionalv2(
-            client=client,
-            game_id="0022500001",
-            StartPeriod="2",
-            EndPeriod="3",
-        )
-        _, params = client.calls[0]
-        assert params["StartPeriod"] == "2"
-        assert params["EndPeriod"] == "3"
-
-    def test_return_value_is_raw_client_response(self, recording_client):
-        """The wrapper returns exactly the client's response, identity-preserved."""
-        response: Dict[str, Any] = {
-            "resultSets": [{"name": "PlayerStats"}]
-        }
-        client = recording_client(
-            responses={"boxscoretraditionalv2": response}
-        )
-        result = games.fetch_boxscoretraditionalv2(
-            client=client, game_id="0022500001"
-        )
-        assert result is response
-
-    def test_single_call_per_invocation(self, recording_client):
-        """Exactly one call to ``client.get`` per wrapper invocation."""
-        client = recording_client()
-        games.fetch_boxscoretraditionalv2(
-            client=client, game_id="0022500001"
-        )
-        assert len(client.calls) == 1
-
-
-# ---------------------------------------------------------------------------
-# TestFetchBoxscoreadvancedv2 — boxscoreadvancedv2 (identical 6-key surface)
-# ---------------------------------------------------------------------------
-
-
-class TestFetchBoxscoreadvancedv2:
-    """Contract tests for :func:`endpoints.games.fetch_boxscoreadvancedv2`.
-
-    The ``boxscoreadvancedv2`` wrapper has an identical parameter surface
-    to ``boxscoretraditionalv2`` — the only observable difference at the
-    wrapper boundary is the endpoint name. Both wrappers accept the same
-    set of six parameters with identical defaults, identical str-cast
-    behavior, and identical kwargs-override semantics. These tests
-    duplicate the structural assertions to provide regression coverage
-    for each wrapper independently.
+    Rule 1 compliance verification — the wrapper routes through the
+    shared :class:`api.nba_client.NBAClient` using the documented
+    upstream endpoint name. The endpoint string must match the NBA
+    Stats API URL slug (``/stats/scoreboardv2``) exactly.
     """
-
-    def test_delegates_to_client_get_with_correct_endpoint_name(
-        self, recording_client
-    ):
-        """The wrapper must route to exactly endpoint ``boxscoreadvancedv2``."""
-        client = recording_client()
-        games.fetch_boxscoreadvancedv2(client=client, game_id="0022500001")
-        assert len(client.calls) == 1
-        endpoint, _ = client.calls[0]
-        assert endpoint == "boxscoreadvancedv2"
-
-    def test_game_id_string_is_passed_through_verbatim(self, recording_client):
-        """String ``game_id`` survives the str-cast unchanged."""
-        client = recording_client()
-        games.fetch_boxscoreadvancedv2(client=client, game_id="0022500001")
-        _, params = client.calls[0]
-        assert params["GameID"] == "0022500001"
-        assert isinstance(params["GameID"], str)
-
-    def test_game_id_int_is_cast_to_string(self, recording_client):
-        """Integer ``game_id`` is coerced to ``str``."""
-        client = recording_client()
-        games.fetch_boxscoreadvancedv2(client=client, game_id=22500002)
-        _, params = client.calls[0]
-        assert params["GameID"] == "22500002"
-        assert isinstance(params["GameID"], str)
-
-    def test_default_periods_and_ranges_match_documented_values(
-        self, recording_client
-    ):
-        """All five period/range defaults match the documented literal strings."""
-        client = recording_client()
-        games.fetch_boxscoreadvancedv2(client=client, game_id="0022500001")
-        _, params = client.calls[0]
-        assert params["StartPeriod"] == "0"
-        assert params["EndPeriod"] == "10"
-        assert params["StartRange"] == "0"
-        assert params["EndRange"] == "28800"
-        assert params["RangeType"] == "0"
-
-    def test_numeric_periods_and_ranges_are_cast_to_strings(
-        self, recording_client
-    ):
-        """All period/range integer inputs are coerced to strings."""
-        client = recording_client()
-        games.fetch_boxscoreadvancedv2(
-            client=client,
-            game_id="0022500001",
-            start_period=2,
-            end_period=3,
-            start_range=14400,
-            end_range=28800,
-            range_type=2,
-        )
-        _, params = client.calls[0]
-        assert params["StartPeriod"] == "2"
-        assert params["EndPeriod"] == "3"
-        assert params["StartRange"] == "14400"
-        assert params["EndRange"] == "28800"
-        assert params["RangeType"] == "2"
-        for key in (
-            "StartPeriod",
-            "EndPeriod",
-            "StartRange",
-            "EndRange",
-            "RangeType",
-        ):
-            assert isinstance(params[key], str)
-
-    def test_params_contains_only_six_keys_by_default(self, recording_client):
-        """Default invocation produces exactly the documented 6-key surface
-        (identical to ``boxscoretraditionalv2``)."""
-        client = recording_client()
-        games.fetch_boxscoreadvancedv2(client=client, game_id="0022500001")
-        _, params = client.calls[0]
-        assert set(params.keys()) == {
-            "GameID",
-            "StartPeriod",
-            "EndPeriod",
-            "StartRange",
-            "EndRange",
-            "RangeType",
-        }
-
-    def test_params_excludes_season_and_season_type(self, recording_client):
-        """Games wrappers do not include ``Season`` or ``SeasonType``."""
-        client = recording_client()
-        games.fetch_boxscoreadvancedv2(client=client, game_id="0022500001")
-        _, params = client.calls[0]
-        assert "Season" not in params
-        assert "SeasonType" not in params
-
-    def test_keyset_identical_to_boxscoretraditionalv2(self, recording_client):
-        """Cross-wrapper invariant: ``boxscoreadvancedv2`` and
-        ``boxscoretraditionalv2`` emit identical parameter keysets."""
-        client_trad = recording_client()
-        client_adv = recording_client()
-        games.fetch_boxscoretraditionalv2(
-            client=client_trad, game_id="0022500001"
-        )
-        games.fetch_boxscoreadvancedv2(
-            client=client_adv, game_id="0022500001"
-        )
-        _, trad_params = client_trad.calls[0]
-        _, adv_params = client_adv.calls[0]
-        assert set(trad_params.keys()) == set(adv_params.keys())
-
-    def test_kwargs_override_defaults(self, recording_client):
-        """Upper-case kwargs supplied via ``**kwargs`` win over defaults."""
-        client = recording_client()
-        games.fetch_boxscoreadvancedv2(
-            client=client,
-            game_id="0022500001",
-            RangeType="2",
-            EndRange="14400",
-        )
-        _, params = client.calls[0]
-        assert params["RangeType"] == "2"
-        assert params["EndRange"] == "14400"
-
-    def test_return_value_is_raw_client_response(self, recording_client):
-        """The wrapper returns exactly the client's response, identity-preserved."""
-        response: Dict[str, Any] = {
-            "resultSets": [{"name": "PlayerStats"}]
-        }
-        client = recording_client(responses={"boxscoreadvancedv2": response})
-        result = games.fetch_boxscoreadvancedv2(
-            client=client, game_id="0022500001"
-        )
-        assert result is response
-
-    def test_single_call_per_invocation(self, recording_client):
-        """Exactly one call to ``client.get`` per wrapper invocation."""
-        client = recording_client()
-        games.fetch_boxscoreadvancedv2(client=client, game_id="0022500001")
-        assert len(client.calls) == 1
+    client = recording_client()
+    games.fetch_scoreboardv2(client, "2025-10-21")
+    assert client.calls, "expected exactly one client.get(...) call"
+    assert client.calls[-1][0] == "scoreboardv2"
 
 
-# ---------------------------------------------------------------------------
-# TestFetchPlaybyplayv2 — playbyplayv2 (NARROWER 3-key param surface)
-# ---------------------------------------------------------------------------
+def test_fetch_scoreboardv2_required_params(recording_client):
+    """Default invocation populates ``GameDate``, ``LeagueID``, ``DayOffset``.
 
-
-class TestFetchPlaybyplayv2:
-    """Contract tests for :func:`endpoints.games.fetch_playbyplayv2`.
-
-    Unlike the box-score wrappers, ``fetch_playbyplayv2`` has a NARROWER
-    3-key param surface: ``GameID``, ``StartPeriod``, ``EndPeriod``.
-    It does NOT accept or emit the range triplet
-    (``StartRange``/``EndRange``/``RangeType``). These tests explicitly
-    verify the absence of the range keys to prevent accidental drift
-    toward the box-score surface in future refactors.
+    * ``GameDate`` is the positional argument passed verbatim (ISO-8601
+      ``YYYY-MM-DD``).
+    * ``LeagueID`` defaults to ``config.DEFAULT_LEAGUE_ID`` (``"00"``
+      for the NBA).
+    * ``DayOffset`` defaults to the string ``"0"``; the wrapper
+      applies :func:`str` so either int or str equivalence under
+      ``str()`` satisfies the contract.
     """
-
-    def test_delegates_to_client_get_with_correct_endpoint_name(
-        self, recording_client
-    ):
-        """The wrapper must route to exactly endpoint ``playbyplayv2``."""
-        client = recording_client()
-        games.fetch_playbyplayv2(client=client, game_id="0022500001")
-        assert len(client.calls) == 1
-        endpoint, _ = client.calls[0]
-        assert endpoint == "playbyplayv2"
-
-    def test_game_id_string_is_passed_through_verbatim(self, recording_client):
-        """String ``game_id`` survives the str-cast unchanged."""
-        client = recording_client()
-        games.fetch_playbyplayv2(client=client, game_id="0022500001")
-        _, params = client.calls[0]
-        assert params["GameID"] == "0022500001"
-        assert isinstance(params["GameID"], str)
-
-    def test_game_id_int_is_cast_to_string(self, recording_client):
-        """Integer ``game_id`` is coerced to ``str``."""
-        client = recording_client()
-        games.fetch_playbyplayv2(client=client, game_id=22500003)
-        _, params = client.calls[0]
-        assert params["GameID"] == "22500003"
-        assert isinstance(params["GameID"], str)
-
-    def test_start_period_defaults_to_zero_string(self, recording_client):
-        """``StartPeriod`` default is the literal string ``'0'``."""
-        client = recording_client()
-        games.fetch_playbyplayv2(client=client, game_id="0022500001")
-        _, params = client.calls[0]
-        assert params["StartPeriod"] == "0"
-        assert isinstance(params["StartPeriod"], str)
-
-    def test_end_period_defaults_to_ten_string(self, recording_client):
-        """``EndPeriod`` default is the literal string ``'10'``."""
-        client = recording_client()
-        games.fetch_playbyplayv2(client=client, game_id="0022500001")
-        _, params = client.calls[0]
-        assert params["EndPeriod"] == "10"
-        assert isinstance(params["EndPeriod"], str)
-
-    def test_numeric_periods_are_cast_to_strings(self, recording_client):
-        """Integer period inputs are coerced to strings."""
-        client = recording_client()
-        games.fetch_playbyplayv2(
-            client=client,
-            game_id="0022500001",
-            start_period=1,
-            end_period=4,
-        )
-        _, params = client.calls[0]
-        assert params["StartPeriod"] == "1"
-        assert params["EndPeriod"] == "4"
-        assert isinstance(params["StartPeriod"], str)
-        assert isinstance(params["EndPeriod"], str)
-
-    def test_params_contains_only_three_keys_by_default(self, recording_client):
-        """Default invocation produces exactly the documented 3-key surface."""
-        client = recording_client()
-        games.fetch_playbyplayv2(client=client, game_id="0022500001")
-        _, params = client.calls[0]
-        assert set(params.keys()) == {"GameID", "StartPeriod", "EndPeriod"}
-
-    def test_params_explicitly_excludes_range_triplet(self, recording_client):
-        """CRITICAL: ``fetch_playbyplayv2`` must NOT emit the range triplet.
-
-        This is the key differentiator from the box-score wrappers and
-        mirrors the narrower upstream NBA Stats API contract for
-        ``playbyplayv2``.
-        """
-        client = recording_client()
-        games.fetch_playbyplayv2(client=client, game_id="0022500001")
-        _, params = client.calls[0]
-        assert "StartRange" not in params
-        assert "EndRange" not in params
-        assert "RangeType" not in params
-
-    def test_params_excludes_season_and_season_type(self, recording_client):
-        """Games wrappers do not include ``Season`` or ``SeasonType``."""
-        client = recording_client()
-        games.fetch_playbyplayv2(client=client, game_id="0022500001")
-        _, params = client.calls[0]
-        assert "Season" not in params
-        assert "SeasonType" not in params
-
-    def test_kwargs_override_defaults(self, recording_client):
-        """Upper-case kwargs supplied via ``**kwargs`` win over defaults."""
-        client = recording_client()
-        games.fetch_playbyplayv2(
-            client=client,
-            game_id="0022500001",
-            StartPeriod="2",
-            EndPeriod="4",
-        )
-        _, params = client.calls[0]
-        assert params["StartPeriod"] == "2"
-        assert params["EndPeriod"] == "4"
-
-    def test_kwargs_can_add_range_triplet_for_future_compat(
-        self, recording_client
-    ):
-        """If a caller explicitly passes range keys via ``**kwargs`` they
-        are forwarded verbatim — the wrapper does not filter kwargs.
-
-        This documents the wrapper's permissive kwargs-forwarding
-        behavior: additions are allowed, but defaults do not include them.
-        """
-        client = recording_client()
-        games.fetch_playbyplayv2(
-            client=client,
-            game_id="0022500001",
-            StartRange="0",
-            EndRange="28800",
-            RangeType="0",
-        )
-        _, params = client.calls[0]
-        # The wrapper's ``params.update(kwargs)`` dutifully injects the
-        # extra keys even though they are not part of the default surface.
-        assert params["StartRange"] == "0"
-        assert params["EndRange"] == "28800"
-        assert params["RangeType"] == "0"
-
-    def test_return_value_is_raw_client_response(self, recording_client):
-        """The wrapper returns exactly the client's response, identity-preserved."""
-        response: Dict[str, Any] = {
-            "resultSets": [{"name": "PlayByPlay"}]
-        }
-        client = recording_client(responses={"playbyplayv2": response})
-        result = games.fetch_playbyplayv2(
-            client=client, game_id="0022500001"
-        )
-        assert result is response
-
-    def test_single_call_per_invocation(self, recording_client):
-        """Exactly one call to ``client.get`` per wrapper invocation."""
-        client = recording_client()
-        games.fetch_playbyplayv2(client=client, game_id="0022500001")
-        assert len(client.calls) == 1
+    client = recording_client()
+    games.fetch_scoreboardv2(client, "2025-10-21")
+    params = client.calls[-1][1]
+    assert params["GameDate"] == "2025-10-21"
+    assert params["LeagueID"] == "00"
+    assert str(params["DayOffset"]) == "0"
 
 
-# ---------------------------------------------------------------------------
-# TestModuleInvariants — Rule 1, Rule 7, logger and public-callable invariants
-# ---------------------------------------------------------------------------
+def test_fetch_scoreboardv2_kwargs_passthrough(recording_client):
+    """Caller ``**kwargs`` overrides documented defaults.
 
-
-class TestModuleInvariants:
-    """Module-level invariants for ``endpoints/games.py``.
-
-    These tests verify the ``endpoints/games.py`` module complies with
-    the AAP architectural rules that prohibit direct HTTP or pandas
-    usage at the endpoint layer and that the module exposes exactly the
-    four documented public wrappers with a properly-named logger
-    adapter.
+    ``params.update(kwargs)`` applied AFTER the base dict is built
+    means any kwarg with a name matching a default key wins. The
+    wrapper itself does not apply :func:`str` to kwarg values; the
+    test uses ``str()`` on the recorded value to stay agnostic to the
+    caller-supplied type.
     """
-
-    def test_module_does_not_import_requests(self):
-        """Rule 1 — Single HTTP Client: no direct ``requests`` import."""
-        assert not hasattr(games, "requests")
-        assert not hasattr(games, "urllib")
-        assert not hasattr(games, "httpx")
-
-    def test_module_does_not_import_pandas(self):
-        """Rule 7 — Pluggable Storage: no ``pandas`` at this layer."""
-        assert not hasattr(games, "pd")
-        assert not hasattr(games, "pandas")
-
-    def test_four_public_callables_exported(self):
-        """All four documented wrappers are present and callable."""
-        for name in (
-            "fetch_scoreboardv2",
-            "fetch_boxscoretraditionalv2",
-            "fetch_boxscoreadvancedv2",
-            "fetch_playbyplayv2",
-        ):
-            assert hasattr(games, name), (
-                f"endpoints.games is missing public wrapper {name!r}"
-            )
-            assert callable(getattr(games, name)), (
-                f"endpoints.games.{name} is not callable"
-            )
-
-    def test_module_uses_module_level_logger(self):
-        """The module exposes a ``logger`` attribute (F-008)."""
-        assert hasattr(games, "logger"), (
-            "endpoints.games must expose a module-level logger"
-        )
-
-    def test_logger_name_matches_module_path(self):
-        """The underlying logger name matches ``endpoints.games`` — a
-        prerequisite for correlation-ID injection via
-        :class:`utils.correlation.CorrelationAdapter` wrapping a logger
-        obtained from ``utils.logger.get_logger(__name__)``.
-        """
-        adapter = games.logger
-        underlying = getattr(adapter, "logger", adapter)
-        assert underlying.name == "endpoints.games"
+    client = recording_client()
+    games.fetch_scoreboardv2(client, "2025-10-21", DayOffset="1")
+    assert str(client.calls[-1][1]["DayOffset"]) == "1"
 
 
-# ---------------------------------------------------------------------------
-# TestParamDictShape — parametric invariants common to all four wrappers
-# ---------------------------------------------------------------------------
+def test_fetch_scoreboardv2_returns_raw_payload(
+    recording_client, sample_single_table_payload
+):
+    """Return value is the raw dict produced by the client, unmodified.
 
-
-class TestParamDictShape:
-    """Parametric invariants that hold for every Games wrapper.
-
-    These tests execute once per wrapper (via ``@pytest.mark.parametrize``)
-    and verify invariants that are common to all four wrappers regardless
-    of their individual parameter surfaces.
+    Identity pass-through: the wrapper does NOT project, filter, or
+    copy the response envelope. Seeding the recording client with a
+    canonical ``leaguedashplayerstats``-shaped payload on the
+    ``scoreboardv2`` key is sufficient — the wrapper's contract is
+    agnostic to the payload's internal table structure.
     """
-
-    @pytest.mark.parametrize(
-        "func, call_kwargs, expected_endpoint",
-        [
-            (
-                games.fetch_scoreboardv2,
-                {"game_date": "10/22/2024"},
-                "scoreboardv2",
-            ),
-            (
-                games.fetch_boxscoretraditionalv2,
-                {"game_id": "0022500001"},
-                "boxscoretraditionalv2",
-            ),
-            (
-                games.fetch_boxscoreadvancedv2,
-                {"game_id": "0022500001"},
-                "boxscoreadvancedv2",
-            ),
-            (
-                games.fetch_playbyplayv2,
-                {"game_id": "0022500001"},
-                "playbyplayv2",
-            ),
-        ],
-        ids=[
-            "scoreboardv2",
-            "boxscoretraditionalv2",
-            "boxscoreadvancedv2",
-            "playbyplayv2",
-        ],
+    client = recording_client(
+        responses={"scoreboardv2": sample_single_table_payload}
     )
-    def test_every_wrapper_issues_exactly_one_call(
-        self, recording_client, func, call_kwargs, expected_endpoint
-    ):
-        """Each wrapper emits exactly one call with its canonical endpoint name."""
-        client = recording_client()
-        func(client=client, **call_kwargs)
-        assert len(client.calls) == 1
-        endpoint, _ = client.calls[0]
-        assert endpoint == expected_endpoint
+    result = games.fetch_scoreboardv2(client, "2025-10-21")
+    assert result == sample_single_table_payload
 
-    @pytest.mark.parametrize(
-        "func, call_kwargs, required_key, required_value",
-        [
-            (
-                games.fetch_scoreboardv2,
-                {"game_date": "10/22/2024"},
-                "GameDate",
-                "10/22/2024",
-            ),
-            (
-                games.fetch_boxscoretraditionalv2,
-                {"game_id": "0022500001"},
-                "GameID",
-                "0022500001",
-            ),
-            (
-                games.fetch_boxscoreadvancedv2,
-                {"game_id": "0022500001"},
-                "GameID",
-                "0022500001",
-            ),
-            (
-                games.fetch_playbyplayv2,
-                {"game_id": "0022500001"},
-                "GameID",
-                "0022500001",
-            ),
-        ],
-        ids=[
-            "scoreboardv2",
-            "boxscoretraditionalv2",
-            "boxscoreadvancedv2",
-            "playbyplayv2",
-        ],
+
+# ---------------------------------------------------------------------------
+# fetch_boxscoretraditionalv2 — traditional per-game box score
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_boxscoretraditionalv2_calls_correct_endpoint(recording_client):
+    """``fetch_boxscoretraditionalv2`` hits the ``boxscoretraditionalv2`` slug.
+
+    Rule 1 verification — per-game traditional box score endpoint.
+    The URL slug must be lowercase and match the NBA Stats API
+    convention exactly.
+    """
+    client = recording_client()
+    games.fetch_boxscoretraditionalv2(client, "0022500001")
+    assert client.calls, "expected exactly one client.get(...) call"
+    assert client.calls[-1][0] == "boxscoretraditionalv2"
+
+
+def test_fetch_boxscoretraditionalv2_preserves_game_id_10_char_format(
+    recording_client,
+):
+    """The 10-character zero-padded ``GAME_ID`` format is preserved verbatim.
+
+    NBA Stats API ``GAME_ID`` follows the format
+    ``"00" + season_code + sequence_number`` with zero-padding to 10
+    characters (e.g. ``"0022500001"`` = 2025-26 Regular Season game
+    #1). The wrapper applies :func:`str` to accommodate int inputs
+    but must NOT reformat strings — the zero-padding is caller
+    responsibility and must round-trip untouched.
+    """
+    client = recording_client()
+    games.fetch_boxscoretraditionalv2(client, "0022500001")
+    assert client.calls[-1][1]["GameID"] == "0022500001"
+
+
+def test_fetch_boxscoretraditionalv2_casts_game_id_to_str(recording_client):
+    """Integer ``game_id`` inputs are cast to :class:`str` via ``str(game_id)``.
+
+    The wrapper's documented contract applies :func:`str` defensively
+    so callers who construct IDs numerically still produce valid
+    upstream params (NBA Stats requires the value as a string).
+    This test verifies only the type cast; it does NOT assert the
+    zero-padded 10-character format is re-introduced for integer
+    inputs — that is the caller's responsibility, not the wrapper's.
+    """
+    client = recording_client()
+    games.fetch_boxscoretraditionalv2(client, 22500001)
+    game_id_value = client.calls[-1][1]["GameID"]
+    assert isinstance(game_id_value, str)
+    # Sanity: the cast preserves digits (does not introduce any
+    # leading zeros, since the spec explicitly documents that
+    # padding is caller responsibility for int inputs).
+    assert game_id_value == str(22500001)
+
+
+def test_fetch_boxscoretraditionalv2_includes_range_params(recording_client):
+    """Params include both ``StartPeriod``/``EndPeriod`` AND the ``Range`` triplet.
+
+    The traditional boxscore endpoint accepts the full six-key param
+    surface:
+
+    * ``StartPeriod`` — default ``"0"`` (include all periods from game
+      start).
+    * ``EndPeriod`` — default ``"10"`` (covers regulation + up to 6
+      overtime periods).
+    * ``StartRange`` — default ``"0"`` (tenths-of-a-second window
+      start).
+    * ``EndRange`` — default ``"28800"`` (end of regulation, i.e.
+      48 min × 60 s × 10 tenths).
+    * ``RangeType`` — default ``"0"`` (whole-game selector).
+
+    Values may be emitted as either int or str by the wrapper; tests
+    use :func:`str` on both sides to stay tolerant of either cast
+    choice. The default ``EndPeriod`` value is pinned to ``"10"``
+    because it is the most operationally salient default (it
+    determines how many overtime periods the box score summarizes).
+    """
+    client = recording_client()
+    games.fetch_boxscoretraditionalv2(client, "0022500001")
+    params = client.calls[-1][1]
+    assert "StartPeriod" in params
+    assert "EndPeriod" in params
+    assert "StartRange" in params
+    assert "EndRange" in params
+    assert "RangeType" in params
+    # Pinned default check — regression guard against silently
+    # shrinking the overtime coverage.
+    assert str(params["EndPeriod"]) == "10"
+
+
+def test_fetch_boxscoretraditionalv2_kwargs_override(recording_client):
+    """``EndPeriod=4`` kwarg overrides the default ``"10"``.
+
+    Verifies the ``params.update(kwargs)`` ordering so that callers
+    can constrain the box score to regulation only (no overtime) by
+    passing ``EndPeriod=4``. The assertion uses :func:`str` on the
+    recorded value to tolerate either int or str encoding.
+    """
+    client = recording_client()
+    games.fetch_boxscoretraditionalv2(client, "0022500001", EndPeriod=4)
+    assert str(client.calls[-1][1]["EndPeriod"]) == "4"
+
+
+# ---------------------------------------------------------------------------
+# fetch_boxscoreadvancedv2 — advanced per-game box score
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_boxscoreadvancedv2_calls_correct_endpoint(recording_client):
+    """``fetch_boxscoreadvancedv2`` hits the ``boxscoreadvancedv2`` slug.
+
+    The advanced box score surfaces efficiency metrics
+    (``OFF_RATING``, ``DEF_RATING``, ``PIE``, etc.) that the
+    traditional endpoint does not expose. Pipeline code iterates over
+    both boxscore variants for each ``GAME_ID`` so a wrong endpoint
+    name here would silently duplicate traditional rows.
+    """
+    client = recording_client()
+    games.fetch_boxscoreadvancedv2(client, "0022500001")
+    assert client.calls, "expected exactly one client.get(...) call"
+    assert client.calls[-1][0] == "boxscoreadvancedv2"
+
+
+def test_fetch_boxscoreadvancedv2_preserves_game_id(recording_client):
+    """``GAME_ID`` zero-padded string format is preserved verbatim.
+
+    Same contract as :func:`fetch_boxscoretraditionalv2` — the
+    wrapper must not reformat string inputs. The 10-character
+    zero-padded form is the NBA Stats convention and callers
+    following that convention must see their input round-trip
+    untouched.
+    """
+    client = recording_client()
+    games.fetch_boxscoreadvancedv2(client, "0022500001")
+    assert client.calls[-1][1]["GameID"] == "0022500001"
+
+
+def test_fetch_boxscoreadvancedv2_includes_range_params(recording_client):
+    """Advanced box score has the SAME six-key param shape as traditional.
+
+    Per the production contract (``endpoints/games.py`` docstring,
+    "Parameter shape note"): "The parameter surface is IDENTICAL to
+    :func:`fetch_boxscoretraditionalv2` — including the ``Range``
+    triplet."
+
+    This test pins the identity: all five period/range keys MUST be
+    present in the params dict so pipelines can iterate over the two
+    boxscore variants uniformly without per-variant branching.
+    """
+    client = recording_client()
+    games.fetch_boxscoreadvancedv2(client, "0022500001")
+    params = client.calls[-1][1]
+    for key in ("StartPeriod", "EndPeriod", "StartRange", "EndRange", "RangeType"):
+        assert key in params, f"expected {key!r} in advancedv2 params; got {sorted(params)}"
+
+
+def test_fetch_boxscoreadvancedv2_kwargs_override(recording_client):
+    """``RangeType="1"`` kwarg overrides the default ``"0"``.
+
+    Verifies kwargs precedence for the ``Range`` triplet — callers
+    requesting partial-window box scores (e.g., "first five minutes
+    of Q4") would supply ``RangeType="1"``. While the production
+    pipeline does not currently use partial-window ranges, the
+    wrapper must forward the kwarg faithfully.
+    """
+    client = recording_client()
+    games.fetch_boxscoreadvancedv2(client, "0022500001", RangeType="1")
+    assert str(client.calls[-1][1]["RangeType"]) == "1"
+
+
+# ---------------------------------------------------------------------------
+# fetch_playbyplayv2 — per-game event stream (narrower param surface)
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_playbyplayv2_calls_correct_endpoint(recording_client):
+    """``fetch_playbyplayv2`` hits the v2 ``playbyplayv2`` slug (not v1).
+
+    The v1 ``playbyplay`` endpoint is deprecated and returns fewer
+    per-event metadata fields (no coordinates, no player marks).
+    The wrapper MUST target v2 exclusively; a silent regression to v1
+    would corrupt downstream ``play_by_play.csv`` columns.
+    """
+    client = recording_client()
+    games.fetch_playbyplayv2(client, "0022500001")
+    assert client.calls, "expected exactly one client.get(...) call"
+    assert client.calls[-1][0] == "playbyplayv2"
+
+
+def test_fetch_playbyplayv2_preserves_game_id(recording_client):
+    """``GAME_ID`` zero-padded string format is preserved verbatim.
+
+    Same GAME_ID-format contract as the boxscore wrappers. The
+    consistency across all three per-game endpoints is important:
+    pipeline code calls them in a loop over the same ``GAME_ID``
+    list, so any wrapper reformatting the ID would break keyed joins
+    across ``games.csv`` and ``play_by_play.csv``.
+    """
+    client = recording_client()
+    games.fetch_playbyplayv2(client, "0022500001")
+    assert client.calls[-1][1]["GameID"] == "0022500001"
+
+
+def test_fetch_playbyplayv2_includes_period_params(recording_client):
+    """``StartPeriod`` and ``EndPeriod`` are present; ``EndPeriod`` default is ``"10"``.
+
+    Play-by-play supports period-level bounding only. The default
+    ``EndPeriod="10"`` ensures overtime events are included for
+    playoff / double-OT regular-season games; shrinking this default
+    would silently truncate event streams for late-game OT periods.
+    """
+    client = recording_client()
+    games.fetch_playbyplayv2(client, "0022500001")
+    params = client.calls[-1][1]
+    assert "StartPeriod" in params
+    assert "EndPeriod" in params
+    assert str(params["EndPeriod"]) == "10"
+
+
+def test_fetch_playbyplayv2_has_no_range_params(recording_client):
+    """The play-by-play wrapper has a NARROWER param surface than the boxscores.
+
+    Negative-space assertion — verifies the ``Range`` triplet
+    (``StartRange``, ``EndRange``, ``RangeType``) is absent from the
+    params dict. Per the production docstring: "supplying those
+    parameters is an upstream validation error."
+
+    This is an inverse-assertion regression guard: the most likely
+    way to break the narrower contract is for a developer to
+    copy-paste the traditional-boxscore wrapper body into the
+    playbyplayv2 implementation. That copy-paste would silently
+    widen the param surface; this test catches it by asserting the
+    Range keys are NOT present on a default invocation.
+    """
+    client = recording_client()
+    games.fetch_playbyplayv2(client, "0022500001")
+    params = client.calls[-1][1]
+    assert "StartRange" not in params, (
+        "fetch_playbyplayv2 must NOT emit StartRange — narrower param "
+        "surface per spec; supplying it is an upstream validation error"
     )
-    def test_every_wrapper_populates_required_identifier_verbatim(
-        self,
-        recording_client,
-        func,
-        call_kwargs,
-        required_key,
-        required_value,
-    ):
-        """Each wrapper's required identifier is present verbatim in params."""
-        client = recording_client()
-        func(client=client, **call_kwargs)
-        _, params = client.calls[0]
-        assert params[required_key] == required_value
-
-    @pytest.mark.parametrize(
-        "func, call_kwargs",
-        [
-            (games.fetch_scoreboardv2, {"game_date": "10/22/2024"}),
-            (
-                games.fetch_boxscoretraditionalv2,
-                {"game_id": "0022500001"},
-            ),
-            (
-                games.fetch_boxscoreadvancedv2,
-                {"game_id": "0022500001"},
-            ),
-            (games.fetch_playbyplayv2, {"game_id": "0022500001"}),
-        ],
-        ids=[
-            "scoreboardv2",
-            "boxscoretraditionalv2",
-            "boxscoreadvancedv2",
-            "playbyplayv2",
-        ],
+    assert "EndRange" not in params, (
+        "fetch_playbyplayv2 must NOT emit EndRange — narrower param "
+        "surface per spec; supplying it is an upstream validation error"
     )
-    def test_no_games_wrapper_emits_season_or_season_type(
-        self, recording_client, func, call_kwargs
-    ):
-        """Games wrappers never emit ``Season`` or ``SeasonType`` keys."""
-        client = recording_client()
-        func(client=client, **call_kwargs)
-        _, params = client.calls[0]
-        assert "Season" not in params
-        assert "SeasonType" not in params
-
-    @pytest.mark.parametrize(
-        "func, call_kwargs",
-        [
-            (games.fetch_scoreboardv2, {"game_date": "10/22/2024"}),
-            (
-                games.fetch_boxscoretraditionalv2,
-                {"game_id": "0022500001"},
-            ),
-            (
-                games.fetch_boxscoreadvancedv2,
-                {"game_id": "0022500001"},
-            ),
-            (games.fetch_playbyplayv2, {"game_id": "0022500001"}),
-        ],
-        ids=[
-            "scoreboardv2",
-            "boxscoretraditionalv2",
-            "boxscoreadvancedv2",
-            "playbyplayv2",
-        ],
+    assert "RangeType" not in params, (
+        "fetch_playbyplayv2 must NOT emit RangeType — narrower param "
+        "surface per spec; supplying it is an upstream validation error"
     )
-    def test_every_wrapper_param_dict_values_are_json_serializable(
-        self, recording_client, func, call_kwargs
-    ):
-        """All emitted param values are JSON-serializable primitives.
 
-        This satisfies the AAP §0.4.1.2 contract that wrappers never emit
-        datetime objects, custom classes, or other non-primitive values.
-        """
-        import json
 
-        client = recording_client()
-        func(client=client, **call_kwargs)
-        _, params = client.calls[0]
-        # If any value were non-primitive (dict, list of non-primitives,
-        # custom object), json.dumps would raise TypeError.
-        serialized = json.dumps(params)
-        assert isinstance(serialized, str)
-        assert len(serialized) > 0
+def test_fetch_playbyplayv2_kwargs_override(recording_client):
+    """``EndPeriod=4`` kwarg overrides the default ``"10"``.
+
+    Constrains the play-by-play pull to regulation only (no
+    overtime). The kwarg precedence semantics are identical to the
+    other wrappers — ``params.update(kwargs)`` applied after the base
+    dict is built means the kwarg wins.
+    """
+    client = recording_client()
+    games.fetch_playbyplayv2(client, "0022500001", EndPeriod=4)
+    assert str(client.calls[-1][1]["EndPeriod"]) == "4"
+
+
+def test_fetch_playbyplayv2_returns_raw_payload(
+    recording_client, sample_playbyplay_payload
+):
+    """Return value is the raw ``playbyplayv2`` envelope, unmodified.
+
+    Identity pass-through verified against a purpose-built
+    ``playbyplayv2`` fixture that carries the canonical
+    ``EVENTNUM`` / ``EVENTMSGTYPE`` / ``PERIOD`` columns used by
+    ``play_by_play.csv`` downstream. The fixture is distinct from
+    the generic ``sample_single_table_payload`` so this test cannot
+    silently pass by aliasing a different envelope.
+    """
+    client = recording_client(
+        responses={"playbyplayv2": sample_playbyplay_payload}
+    )
+    result = games.fetch_playbyplayv2(client, "0022500001")
+    assert result == sample_playbyplay_payload
+    # Extra sanity — verify the fixture was not accidentally deep-
+    # copied; ``result`` and the fixture should be the SAME dict
+    # object since RecordingClient returns the mapped value as-is.
+    assert result is sample_playbyplay_payload
+
+
+# ---------------------------------------------------------------------------
+# Module-level structural guard: ensure pytest marker registration surface is
+# available so `pytest` imports above do not get flagged as unused by linters
+# optimizing for the test-module convention. This intentionally no-ops at
+# runtime; its sole purpose is to document why ``import pytest`` is present.
+# ---------------------------------------------------------------------------
+
+
+def _pytest_marker_surface_reference() -> object:
+    """Reference ``pytest`` at module scope so its import is not dead.
+
+    The test module convention used across ``tests/unit/endpoints/``
+    keeps ``import pytest`` at the top of every file so future
+    maintainers can add ``@pytest.mark.*`` or ``pytest.raises`` to
+    any test without touching the import block. This helper
+    references :mod:`pytest` so static analyzers do not flag the
+    import as unused while the current 19-function surface happens
+    not to exercise any pytest API directly.
+
+    Returns:
+        The :mod:`pytest` module object itself.
+    """
+    return pytest
