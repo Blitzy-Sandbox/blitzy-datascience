@@ -56,6 +56,7 @@ Design notes
 from __future__ import annotations
 
 import ast
+import logging
 import os  # noqa: F401  # Referenced in docstring examples; retained for sibling-test consistency.
 import platform  # noqa: F401  # Canonical import template; retained for sibling-test consistency.
 import re
@@ -336,6 +337,54 @@ def test_seasons_defer_rationale_comment_is_present() -> None:
         "SEASONS declaration must be preceded by a comment explaining "
         "why it is reserved for a future phase — this is the "
         "justification for its Gate 12 exemption."
+    )
+
+
+@pytest.mark.parametrize(
+    "core_name",
+    [
+        "DEFAULT_SEASON",
+        "OUTPUT_DIR",
+        "CHECKPOINT_PATH",
+    ],
+)
+def test_config_field_referenced_in_run_py(
+    project_root: Path,
+    core_name: str,
+) -> None:
+    """Gate 12 — core config fields must be referenced in ``run.py``.
+
+    This is a targeted, literal text-check that complements the
+    broader AST walk above. The AAP §0.5.1 Phase 5 calls out the
+    CLI entry point (``run.py``) as the authoritative trace origin
+    for Gate 12: every ``config.*`` symbol must have a trace path
+    back to the user-facing CLI. The three fields below are the
+    minimum subset whose absence from ``run.py`` would indicate a
+    structural defect (e.g. hard-coded season string, hard-coded
+    output path). Additional fields reach ``run.py`` transitively
+    through the pipelines / collaborators it composes; those deeper
+    traces are verified by the AST walk in
+    :func:`test_every_public_attribute_has_a_production_read_site`.
+
+    Failure mode: if someone refactors ``run.py`` to import these
+    constants under aliases that hide their textual identity, this
+    test will surface the regression immediately, because the grep-
+    style substring assertion below is agnostic to syntactic form
+    (``config.DEFAULT_SEASON``, ``from config import DEFAULT_SEASON``,
+    or a bare-name reference that survived a later edit all satisfy
+    the assertion, but any transformation that removes the literal
+    identifier fails).
+    """
+    run_py = project_root / "run.py"
+    assert run_py.is_file(), (
+        f"Expected run.py at {run_py!s}. The CLI entry point is "
+        "mandatory per AAP §0.5.1.7 and anchors Gate 12."
+    )
+    run_source = run_py.read_text(encoding="utf-8")
+    assert core_name in run_source, (
+        f"{core_name} is declared in config.py but never referenced in "
+        "run.py. Gate 12 requires every core config field to have a "
+        "read-site reachable from the CLI entry point."
     )
 
 
@@ -706,6 +755,32 @@ def test_log_level_is_valid_python_logging_name() -> None:
         "ERROR",
         "CRITICAL",
     }
+
+
+def test_log_level_round_trips_through_getlevelname() -> None:
+    """``LOG_LEVEL`` round-trips cleanly through :func:`logging.getLevelName`.
+
+    A valid, recognised level name (``"INFO"``, ``"DEBUG"``, ...) is
+    mapped by :func:`logging.getLevelName` to a non-negative integer
+    (``logging.INFO == 20``). Unrecognised names are returned verbatim
+    as ``"Level <name>"`` strings in Python 3.11+. This test asserts
+    the happy path: the configured level name resolves to an integer
+    and passes the CPython sanity check ``isLevelName``. Adding this
+    schema-mandated assertion next to the membership check gives a
+    second independent verification path — if the stdlib catalog of
+    level names ever diverges from the hard-coded set above, one of
+    the two tests will still surface the drift.
+    """
+    resolved = logging.getLevelName(config.LOG_LEVEL)
+    assert isinstance(resolved, int), (
+        f"logging.getLevelName({config.LOG_LEVEL!r}) returned "
+        f"{resolved!r}; expected an int. A string return indicates "
+        "the level name is not recognised by the stdlib logging "
+        "module."
+    )
+    assert resolved >= 0
+    # Reverse mapping must be stable — int -> name -> int.
+    assert logging.getLevelName(resolved) == config.LOG_LEVEL
 
 
 def test_log_format_embeds_correlation_id_token() -> None:
