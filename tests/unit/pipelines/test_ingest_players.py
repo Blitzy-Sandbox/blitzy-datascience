@@ -155,6 +155,7 @@ from __future__ import annotations
 import inspect
 import logging
 from typing import Any, Dict, List, Tuple
+from unittest.mock import MagicMock
 
 import pandas as pd
 import pytest
@@ -325,6 +326,74 @@ _SEASON: str = "2025-26"
 def _domain() -> str:
     """Return the Players checkpoint domain under test."""
     return config.DOMAIN_PLAYERS
+
+
+# Schema-specified checkpoint keys (AAP §0.5.1.8). Composed from the
+# canonical :data:`_SEASON` constant and the upstream endpoint label
+# strings that :data:`pipelines.ingest_players._ENDPOINT_PLAN` emits,
+# so a change to either the season pin or the endpoint-name vocabulary
+# cascades through tests without manual updates.
+_KEY_PRIMARY: str = f"leaguedashplayerstats:{_SEASON}"
+_KEY_TRACKING: str = f"leaguedashptstats:{_SEASON}"
+
+
+def _make_tracking_fakes(recording_writer, recording_checkpoint):
+    """Wrap factory-produced fakes with shared event-log instrumentation.
+
+    Used by the Rule 5 interleaving assertion
+    (:func:`test_rule5_ordering_write_precedes_mark_for_each_endpoint`)
+    to capture the cross-fake operation sequence in a single list
+    rather than two separately-timestamped records. Monkey-patches
+    the instance methods of freshly-produced
+    :class:`~tests.conftest.RecordingWriter` and
+    :class:`~tests.conftest.RecordingCheckpoint` instances rather than
+    subclassing so this helper is resilient to the conftest's exact
+    class exposure surface (module-scope attribute, factory closure,
+    etc.) — the classes do not need to be importable by name.
+
+    Parameters
+    ----------
+    recording_writer:
+        The :func:`tests.conftest.recording_writer` fixture, a
+        zero-argument factory returning a fresh
+        :class:`~tests.conftest.RecordingWriter`.
+    recording_checkpoint:
+        The :func:`tests.conftest.recording_checkpoint` fixture, a
+        zero-argument factory returning a fresh
+        :class:`~tests.conftest.RecordingCheckpoint`.
+
+    Returns
+    -------
+    Tuple[Any, Any, List[Tuple[str, str]]]
+        ``(writer, checkpoint, event_log)``. ``event_log`` is a
+        shared list populated in strict invocation order with
+        ``("write", csv_name)`` entries (appended after each
+        successful ``writer.write`` call) and ``("mark", key)``
+        entries (appended after each ``checkpoint.mark_completed``
+        call). Exact list equality against the expected ``write →
+        mark → write → mark`` sequence catches any batch-write
+        regression that would violate Rule 5's
+        resumability guarantee (AAP §0.7.2.5).
+    """
+    writer = recording_writer()
+    checkpoint = recording_checkpoint()
+    event_log: List[Tuple[str, str]] = []
+
+    orig_write = writer.write
+    orig_mark = checkpoint.mark_completed
+
+    def write_and_log(df, name, season):
+        result = orig_write(df, name, season)
+        event_log.append(("write", str(name)))
+        return result
+
+    def mark_and_log(domain, key):
+        orig_mark(domain, key)
+        event_log.append(("mark", str(key)))
+
+    writer.write = write_and_log
+    checkpoint.mark_completed = mark_and_log
+    return writer, checkpoint, event_log
 
 
 # ---------------------------------------------------------------------------
@@ -1926,6 +1995,314 @@ class TestEnsureSeasonColumn:
 
         assert result.columns[0] == "season"
         assert len(result) == 0
+
+
+# ---------------------------------------------------------------------------
+# Schema-specified module-level tests (AAP §0.5.1.8 Group 8)
+#
+# These five test functions cover the explicit Phase 10 validation
+# matrix from the file's agent prompt:
+#
+#   pytest -k "rule5"       -> finds EXACTLY one test
+#       (test_rule5_ordering_write_precedes_mark_for_each_endpoint)
+#   pytest -k "idempotency" -> finds EXACTLY two tests
+#       (test_run_partial_idempotency_skips_primary_runs_tracking,
+#        test_run_full_idempotency_no_writes_when_both_checkpointed)
+#
+# They supplement — rather than replace — the classful test matrix
+# above, anchoring the Rule 5 interleaving invariant (AAP §0.7.2.5)
+# and the resume / no-op idempotency contracts (AAP §0.7.2.5) as
+# first-class, discoverable selector surfaces.
+# ---------------------------------------------------------------------------
+
+
+def test_run_happy_path_writes_both_csvs_and_marks_both_checkpoints(
+    recording_client,
+    recording_writer,
+    recording_checkpoint,
+    sample_single_table_payload,
+):
+    """Both endpoints fetched, both CSVs written, both keys checkpointed.
+
+    Exercises the 2-endpoint iteration of
+    :data:`pipelines.ingest_players._ENDPOINT_PLAN` with no prior
+    checkpoint state: the pipeline must fetch both
+    ``leaguedashplayerstats`` and ``leaguedashptstats``, emit both
+    ``players.csv`` and ``player_tracking.csv`` through
+    :meth:`~tests.conftest.RecordingWriter.write` in order, and mark
+    both keys under ``config.DOMAIN_PLAYERS`` in the checkpoint. The
+    metrics boundary receives exactly two
+    ``pipeline_rows_written_total`` increments (one per endpoint pull).
+    """
+    client = recording_client(
+        responses={
+            "leaguedashplayerstats": sample_single_table_payload,
+            "leaguedashptstats": sample_single_table_payload,
+        }
+    )
+    writer = recording_writer()
+    checkpoint = recording_checkpoint()
+    metrics_mock = MagicMock()
+
+    ingest_players.run(
+        client=client,
+        writer=writer,
+        checkpoint=checkpoint,
+        season=_SEASON,
+        metrics=metrics_mock,
+    )
+
+    # ---- Both endpoints were called ----
+    called_endpoints = [call[0] for call in client.calls]
+    assert "leaguedashplayerstats" in called_endpoints, (
+        f"expected leaguedashplayerstats call; got {called_endpoints!r}"
+    )
+    assert "leaguedashptstats" in called_endpoints, (
+        f"expected leaguedashptstats call; got {called_endpoints!r}"
+    )
+
+    # ---- Writer received exactly two calls in the canonical order ----
+    assert len(writer.writes) == 2, (
+        f"expected 2 writes; got {len(writer.writes)}"
+    )
+    names_in_order = [w["name"] for w in writer.writes]
+    assert names_in_order == [config.CSV_PLAYERS, config.CSV_PLAYER_TRACKING], (
+        f"expected order [{config.CSV_PLAYERS}, {config.CSV_PLAYER_TRACKING}]; "
+        f"got {names_in_order!r}"
+    )
+    for record in writer.writes:
+        assert record["season"] == _SEASON
+        assert record["rows"] > 0
+
+    # ---- Checkpoint marked BOTH keys under DOMAIN_PLAYERS, in order ----
+    assert checkpoint.marks == [
+        (config.DOMAIN_PLAYERS, _KEY_PRIMARY),
+        (config.DOMAIN_PLAYERS, _KEY_TRACKING),
+    ], f"expected marks in order; got {checkpoint.marks!r}"
+
+    # ---- Both is_completed probes occurred ----
+    check_keys = [check[1] for check in checkpoint.checks]
+    assert _KEY_PRIMARY in check_keys
+    assert _KEY_TRACKING in check_keys
+
+    # ---- Metrics: exactly two pipeline_rows_written_total increments ----
+    rows_written_calls = [
+        c for c in metrics_mock.inc.call_args_list
+        if c.args and c.args[0] == "pipeline_rows_written_total"
+    ]
+    assert len(rows_written_calls) == 2, (
+        f"expected 2 pipeline_rows_written_total increments; "
+        f"got {metrics_mock.inc.call_args_list!r}"
+    )
+
+
+def test_rule5_ordering_write_precedes_mark_for_each_endpoint(
+    recording_client,
+    recording_writer,
+    recording_checkpoint,
+    sample_single_table_payload,
+):
+    """Rule 5 (AAP §0.7.2.5): interleaved write → mark sequence per endpoint.
+
+    For each endpoint the operation order is
+    ``write → mark_completed``, and the SECOND endpoint's fetch must
+    not happen until the FIRST endpoint's ``mark_completed`` has
+    been recorded. :func:`_make_tracking_fakes` wraps the conftest-
+    produced fakes with a shared event log; this test asserts the
+    exact interleaved sequence::
+
+        write(players) → mark(players_key) →
+        write(player_tracking) → mark(player_tracking_key)
+
+    Any deviation (for example, ``write → write → mark → mark``)
+    indicates a batch-write regression that would violate the
+    resumability guarantee: if the second write fails, the first
+    must already be marked complete so a resume run skips it.
+    """
+    client = recording_client(
+        responses={
+            "leaguedashplayerstats": sample_single_table_payload,
+            "leaguedashptstats": sample_single_table_payload,
+        }
+    )
+    writer, checkpoint, event_log = _make_tracking_fakes(
+        recording_writer, recording_checkpoint,
+    )
+
+    ingest_players.run(
+        client=client,
+        writer=writer,
+        checkpoint=checkpoint,
+        season=_SEASON,
+    )
+
+    expected = [
+        ("write", config.CSV_PLAYERS),
+        ("mark", _KEY_PRIMARY),
+        ("write", config.CSV_PLAYER_TRACKING),
+        ("mark", _KEY_TRACKING),
+    ]
+    assert event_log == expected, (
+        f"Rule 5 ordering violated.\n"
+        f"Expected: {expected!r}\nActual:   {event_log!r}"
+    )
+
+
+def test_run_partial_idempotency_skips_primary_runs_tracking(
+    recording_client,
+    recording_writer,
+    recording_checkpoint,
+    sample_single_table_payload,
+):
+    """Partial idempotency: PRIMARY pre-checkpointed, only TRACKING runs.
+
+    Mirrors the most common crash-and-resume scenario: the
+    ``leaguedashplayerstats`` endpoint succeeded and was marked
+    complete, then the process died before
+    ``leaguedashptstats`` could write. On restart, the pipeline
+    must skip the primary endpoint (no redundant HTTP call, no
+    duplicate CSV write, no duplicate mark) and attempt only the
+    tracking endpoint. This is the primary motivation for
+    per-endpoint checkpointing; the single-endpoint idempotency
+    tests elsewhere in this module do not prove that the loop
+    correctly handles a partially-completed plan.
+    """
+    client = recording_client(
+        responses={
+            "leaguedashplayerstats": sample_single_table_payload,
+            "leaguedashptstats": sample_single_table_payload,
+        }
+    )
+    writer = recording_writer()
+    checkpoint = recording_checkpoint(
+        completed={config.DOMAIN_PLAYERS: [_KEY_PRIMARY]},
+    )
+
+    ingest_players.run(
+        client=client,
+        writer=writer,
+        checkpoint=checkpoint,
+        season=_SEASON,
+    )
+
+    # ---- Only the tracking endpoint was called ----
+    called_endpoints = [call[0] for call in client.calls]
+    assert "leaguedashplayerstats" not in called_endpoints, (
+        f"primary endpoint was unexpectedly called; got {called_endpoints!r}"
+    )
+    assert "leaguedashptstats" in called_endpoints, (
+        f"expected leaguedashptstats call; got {called_endpoints!r}"
+    )
+
+    # ---- Exactly one write: player_tracking ----
+    assert len(writer.writes) == 1, (
+        f"expected exactly 1 write; got {len(writer.writes)}"
+    )
+    assert writer.writes[0]["name"] == config.CSV_PLAYER_TRACKING
+    assert writer.writes[0]["season"] == _SEASON
+
+    # ---- Exactly one new mark: tracking ----
+    assert checkpoint.marks == [
+        (config.DOMAIN_PLAYERS, _KEY_TRACKING),
+    ], f"expected only tracking mark; got {checkpoint.marks!r}"
+
+
+def test_run_full_idempotency_no_writes_when_both_checkpointed(
+    recording_client,
+    recording_writer,
+    recording_checkpoint,
+    sample_single_table_payload,
+):
+    """Full idempotency: BOTH endpoints pre-checkpointed → pure no-op.
+
+    When both keys are already marked complete, ``ingest_players.run``
+    performs no HTTP requests, no writes, and adds no new marks.
+    This is the successful-resume-of-completed-run scenario: a
+    subsequent invocation with the same ``--season`` and the
+    ``checkpoint.json`` left behind by a prior successful run must
+    be a pure no-op on the upstream and filesystem boundaries.
+    Only the idempotency probes (``is_completed``) fire — the
+    ``for`` loop still iterates the plan but skips every entry.
+    """
+    client = recording_client(
+        responses={
+            "leaguedashplayerstats": sample_single_table_payload,
+            "leaguedashptstats": sample_single_table_payload,
+        }
+    )
+    writer = recording_writer()
+    checkpoint = recording_checkpoint(
+        completed={config.DOMAIN_PLAYERS: [_KEY_PRIMARY, _KEY_TRACKING]},
+    )
+
+    ingest_players.run(
+        client=client,
+        writer=writer,
+        checkpoint=checkpoint,
+        season=_SEASON,
+    )
+
+    assert client.calls == [], (
+        f"no endpoint calls expected; got {client.calls!r}"
+    )
+    assert writer.writes == [], (
+        f"no writes expected; got {writer.writes!r}"
+    )
+    assert checkpoint.marks == [], (
+        f"no new marks expected; got {checkpoint.marks!r}"
+    )
+
+    # Both is_completed probes still happen before the skip decision
+    check_keys = [check[1] for check in checkpoint.checks]
+    assert _KEY_PRIMARY in check_keys
+    assert _KEY_TRACKING in check_keys
+
+
+def test_library_only_endpoints_not_invoked(
+    recording_client,
+    recording_writer,
+    recording_checkpoint,
+    sample_single_table_payload,
+):
+    """``leaguedashplayerclutch`` / ``playercareerstats`` /
+    ``playergamelog`` are library-only wrappers (exposed by
+    :mod:`endpoints.players` but NOT orchestrated by
+    :data:`pipelines.ingest_players._ENDPOINT_PLAN`);
+    :func:`pipelines.ingest_players.run` MUST NOT invoke them.
+
+    Verifies the pipeline's documented scope boundary: only the two
+    league-wide aggregate endpoints
+    (``leaguedashplayerstats`` and ``leaguedashptstats``) are part of
+    the orchestrated flow. The per-player and split-aware endpoints
+    remain available to ad-hoc library consumers of
+    :mod:`endpoints.players` but are never called implicitly during
+    an ``ingest_players.run`` invocation — preventing accidental
+    scope creep if the plan tuple is mis-edited.
+    """
+    client = recording_client(
+        responses={
+            "leaguedashplayerstats": sample_single_table_payload,
+            "leaguedashptstats": sample_single_table_payload,
+        }
+    )
+    writer = recording_writer()
+    checkpoint = recording_checkpoint()
+
+    ingest_players.run(
+        client=client,
+        writer=writer,
+        checkpoint=checkpoint,
+        season=_SEASON,
+    )
+
+    forbidden = {"leaguedashplayerclutch", "playercareerstats", "playergamelog"}
+    called = {call[0] for call in client.calls}
+    overlap = forbidden & called
+    assert not overlap, (
+        f"library-only endpoints invoked: {overlap!r}; "
+        f"pipeline orchestrator should only invoke endpoints from "
+        f"ingest_players._ENDPOINT_PLAN"
+    )
 
 
 # ---------------------------------------------------------------------------
