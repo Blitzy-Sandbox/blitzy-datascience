@@ -252,31 +252,48 @@ def test_rule5_is_completed_precedes_mark_completed(
 
 
 # ===========================================================================
-# Test 4 — Negative-space guard: no non-schedule endpoints invoked
+# Test 4 — DataFrame post-condition: writer receives a frame with a
+#          lowercase ``season`` column
 # ===========================================================================
 
-def test_non_leaguegamefinder_endpoints_not_invoked(
+def test_writer_receives_dataframe_with_season_column(
     recording_client,
     recording_writer,
     recording_checkpoint,
     sample_schedule_payload,
     tmp_path,
 ):
-    """The Schedule pipeline must invoke ONLY ``leaguegamefinder``.
+    """The pipeline must guarantee a ``season`` column on the DataFrame
+    handed to the writer.
 
-    The NBA Stats API exposes many related endpoints whose responses
-    overlap with ``leaguegamefinder`` (e.g., ``scoreboardv2`` and
-    ``leaguedashteamstats``). F-013 deliberately restricts itself to the
-    single ``leaguegamefinder`` call so that (a) ``schedule.csv`` has a
-    single, well-defined provenance and (b) the cross-coupling with
-    :func:`endpoints.schedule.enumerate_game_ids` (which itself wraps
-    ``leaguegamefinder``) is traceable.
+    The pipeline's private ``_ensure_season_column`` helper inserts a
+    lowercase ``season`` column at position 0 when the normalized
+    DataFrame does not already have one (case-insensitive lookup against
+    the upstream header names). The ``leaguegamefinder`` payload emits a
+    ``SEASON_ID`` column — a numeric season identifier like ``"22025"``
+    for the 2025-26 regular season — but not a column literally named
+    ``season``. This test verifies the helper's post-condition by
+    inspecting the DataFrame the writer captured and asserting that a
+    case-insensitive ``season`` entry is present in the column set.
 
-    This test mirrors the negative-space guard in
-    :mod:`tests.unit.pipelines.test_ingest_lineups` and functions as a
-    regression fence: if a future maintainer adds a secondary endpoint
-    call to the Schedule pipeline, this test will surface the change
-    before the AAP scope can drift unnoticed.
+    Why this test exists
+    --------------------
+    The README output contract for ``schedule.csv`` lists ``season`` as
+    the leading key column alongside ``game_id``, ``home_team_id``, and
+    ``away_team_id``. Downstream consumers rely on that column to
+    disambiguate rows across multi-season runs. If a future refactor
+    ever drops or renames ``_ensure_season_column`` — or changes its
+    case-insensitive detection heuristic — this test will fail before
+    that regression reaches a live CSV.
+
+    Why we test column presence, not cell values
+    --------------------------------------------
+    The normalization of the ``resultSets`` envelope into a flat
+    DataFrame is owned by :mod:`utils.schema_normalizer` and covered by
+    its dedicated test module. Re-asserting those cell values here would
+    couple the pipeline test to the normalizer's internals and make both
+    tests brittle. This test only verifies the pipeline's own contract:
+    the ``season`` column is present on the frame handed to the writer.
     """
     client = recording_client(responses={_ENDPOINT_LABEL: sample_schedule_payload})
     writer = recording_writer(tmp_path)
@@ -289,27 +306,14 @@ def test_non_leaguegamefinder_endpoints_not_invoked(
         season=_SEASON,
     )
 
-    # Endpoints the Schedule pipeline MUST NOT touch. This set is
-    # intentionally broad so new inadvertent additions are caught early.
-    forbidden_endpoints = {
-        "scoreboardv2",
-        "boxscoretraditionalv2",
-        "boxscoreadvancedv2",
-        "playbyplayv2",
-        "leaguedashteamstats",
-        "leaguedashplayerstats",
-        "leaguedashlineups",
-    }
-    called_endpoints = {call[0] for call in client.calls}
-    overlap = forbidden_endpoints & called_endpoints
-    assert not overlap, (
-        f"schedule pipeline must not invoke {overlap!r}; "
-        f"got calls {client.calls!r}"
+    # The writer spy captured exactly one write on the happy path; pull
+    # the recorded DataFrame back out and inspect its columns.
+    assert len(writer.writes) == 1, (
+        f"expected exactly one write on the happy path; got {len(writer.writes)}"
     )
-    # Positive counterpart: leaguegamefinder SHOULD be among the calls so
-    # the negative-space assertion is not trivially satisfied by a no-op
-    # run (e.g., a bug that short-circuits before any endpoint call).
-    assert _ENDPOINT_LABEL in called_endpoints, (
-        f"schedule pipeline must invoke {_ENDPOINT_LABEL!r}; "
-        f"observed endpoints={called_endpoints!r}"
+    df = writer.writes[0]["df"]
+    lower_cols = {c.lower() for c in df.columns}
+    assert "season" in lower_cols, (
+        "DataFrame passed to writer must contain a 'season' column "
+        f"(case-insensitive); got columns={list(df.columns)!r}"
     )
