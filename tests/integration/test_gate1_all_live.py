@@ -73,10 +73,29 @@ def _stats_nba_reachable() -> bool:
     ``all`` run will spend vastly more time than that on its first
     real request. This is the *only* function in the module permitted
     to use ``try``/``except`` (per Phase 9 rule-compliance check).
+
+    The opened socket is explicitly closed via :keyword:`with` so
+    it does not leak into pytest's unraisable-exception handler — in
+    pytest 9.x, a resource warning from a garbage-collected open
+    socket is elevated to
+    :class:`~_pytest.unraisableexception.PytestUnraisableExceptionWarning`
+    and fails the test under ``pytest.ini``'s ``filterwarnings=error``
+    policy unless the socket is deterministically closed. This matches
+    the pattern already used by the Gate 8 sibling helper at
+    ``tests/integration/test_gate8_games_resume.py``.
+
+    Returns
+    -------
+    bool
+        ``True`` when a TCP socket to ``stats.nba.com:443`` opens
+        within 5 seconds; ``False`` on any :class:`OSError` (which is
+        the common base class for :class:`TimeoutError`,
+        :class:`ConnectionRefusedError`, and :class:`socket.gaierror`).
+        Never raises.
     """
     try:
-        socket.create_connection(("stats.nba.com", 443), timeout=5)
-        return True
+        with socket.create_connection(("stats.nba.com", 443), timeout=5):
+            return True
     except OSError:
         return False
 
