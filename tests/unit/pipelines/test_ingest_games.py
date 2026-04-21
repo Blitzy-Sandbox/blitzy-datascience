@@ -1,0 +1,1058 @@
+"""Unit tests for :mod:`pipelines.ingest_games` (Feature F-011).
+
+Scope
+-----
+The Games pipeline is the most complex of the five domain pipelines in
+this project — and the *only* one permitted to wrap its per-entity loop
+in ``try/except Exception`` (AAP §0.7.2.6, Rule 6 "Fail-Safe Game
+Iteration"). Because Rule 6 is behaviourally unique to this module,
+this test file also houses the mandatory **Rule 6 canary** suite that
+verifies the fail-safe semantics under three adversarial scenarios:
+single-game failure, blanket failure, and negative-space verification
+that failures raised *outside* the per-game body (notably by
+``enumerate_game_ids``) do *not* get swallowed.
+
+Verified behaviours
+-------------------
+1. **Happy path** — with 3 game IDs returned by
+   :func:`endpoints.schedule.enumerate_game_ids` (monkey-patched at the
+   module level — see *Monkey-patch target* below) and a clean
+   checkpoint, invoking :func:`pipelines.ingest_games.run` results in
+   exactly 2 ``client.get`` calls per game (one each to
+   ``boxscoretraditionalv2`` and ``playbyplayv2``), exactly 2
+   ``writer.write`` calls per game (``config.CSV_GAMES`` then
+   ``config.CSV_PLAY_BY_PLAY``, with *cumulative* concatenated
+   buffers), exactly 1 ``checkpoint.mark_completed`` per successful
+   game keyed by ``(config.DOMAIN_GAMES, <GAME_ID>)``, and one
+   ``pipeline_rows_written_total`` metric increment per write with
+   labels ``{"domain": "games", "file": "games"|"play_by_play"}`` and
+   the ``n=`` keyword carrying the single-game row count (*not* the
+   cumulative row count — each game contributes its own row delta).
+
+2. **Idempotency (Rule 5 resume behaviour)** — a checkpoint
+   pre-seeded with every game ID short-circuits ``get_pending`` to an
+   empty list and the pipeline returns immediately without invoking
+   the client, the writer, or ``mark_completed``. The ``get_pending``
+   probe *is* recorded (that's how the skip is decided), but no other
+   side effects occur.
+
+3. **Rule 5 ordering per game** — for every successful game, the
+   pipeline emits *two* writes (games, then play-by-play) *before* the
+   corresponding ``mark_completed``. The test verifies this by
+   inspecting the interleaved order of spy records across 3 games.
+
+4. **Negative-space guard** — only the two permitted endpoints are
+   invoked (``boxscoretraditionalv2``, ``playbyplayv2``); the pipeline
+   must *not* call any of the other 14 endpoints registered in
+   :mod:`endpoints` (e.g. ``leaguegamefinder``, ``leaguedashteamstats``,
+   ``leaguedashlineups``).
+
+5. **Rule 6 CANARY — single game failure** — when exactly one of three
+   game IDs raises at its first fetch (``boxscoretraditionalv2``), the
+   pipeline must: (a) not re-raise, (b) increment
+   ``games_failed_total{game_id=<failing_gid>}`` exactly once, (c)
+   emit a WARNING log with the format string ``"game %s failed: %s"``,
+   (d) *not* call ``checkpoint.mark_completed`` for the failing GID,
+   (e) still successfully process and mark the other two games, and
+   (f) never accumulate the failed game's rows into either CSV
+   buffer.
+
+6. **Rule 6 CANARY — blanket failure** — when *all* three game IDs
+   raise at ``boxscoretraditionalv2``, the pipeline still completes
+   without raising; ``writer.write`` is never called; no game is
+   checkpointed; ``games_failed_total`` is incremented three times
+   (once per GID); the final log line reports ``processed=0 failed=3``.
+
+7. **Rule 6 scope — ``enumerate_game_ids`` failure propagates** —
+   Rule 6's ``try/except`` is scoped to the *per-game* body only.
+   Exceptions raised by ``enumerate_game_ids`` (upstream of the loop)
+   propagate to the caller verbatim; no warning log, no metric bump,
+   and no pipeline-level swallowing.
+
+Monkey-patch target
+-------------------
+Because :mod:`pipelines.ingest_games` performs
+
+    from endpoints.schedule import enumerate_game_ids
+
+at *module scope* (see source lines 165–169), the monkey-patch target
+for every test that wants to control the enumeration output is
+
+    monkeypatch.setattr(
+        "pipelines.ingest_games.enumerate_game_ids",
+        lambda client, season: [...],
+    )
+
+Patching :mod:`endpoints.schedule.enumerate_game_ids` directly would
+*not* work because the name is resolved at import time and bound into
+the ``pipelines.ingest_games`` namespace.
+
+Style conventions
+-----------------
+- Symbolic references via :mod:`config` (``config.DOMAIN_GAMES``,
+  ``config.CSV_GAMES``, ``config.CSV_PLAY_BY_PLAY``) — no hardcoded
+  string literals in assertions (AAP Phase 7 style convention).
+- Handwritten ``recording_*`` spies via the conftest.py factory
+  fixtures; :class:`unittest.mock.MagicMock` is reserved for the
+  metrics sink and (when exact call captures are needed) the logger.
+- Rule 6 is **behaviourally exclusive** to this pipeline — AAP
+  §0.7.2.6 — so the canary tests below are the authoritative guard
+  against regressions that would extend Rule 6 to other pipelines
+  or weaken its scope here.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, Iterable, List, Optional
+from unittest.mock import MagicMock
+
+import pytest  # noqa: F401  (imported to satisfy Phase 1 header convention)
+
+import config
+from pipelines import ingest_games
+
+
+# ---------------------------------------------------------------------------
+# Module-level constants
+# ---------------------------------------------------------------------------
+
+#: Season string used by every test. Must match the ``season`` kwarg
+#: propagated into :func:`pipelines.ingest_games.run` and is verified
+#: by assertions against ``writer.writes[*]["season"]`` and the
+#: checkpoint key schema.
+_SEASON = "2025-26"
+
+#: Endpoint name for the traditional box score. Appears as ``calls[i][0]``
+#: in :class:`RecordingClient.calls` — see conftest.py.
+_BOXSCORE_ENDPOINT = "boxscoretraditionalv2"
+
+#: Endpoint name for the play-by-play endpoint.
+_PLAYBYPLAY_ENDPOINT = "playbyplayv2"
+
+#: The three NBA Stats-style GAME_IDs used by every happy-path and
+#: Rule 6 test. Structured so that a "failure on G2" scenario
+#: deterministically leaves G1 and G3 succeeding — enabling strong
+#: ordering assertions around the writer buffer and checkpoint marks.
+_GAME_IDS = ("0022500001", "0022500002", "0022500003")
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _patch_enumerate(
+    monkeypatch: pytest.MonkeyPatch,
+    game_ids: Iterable[str] = _GAME_IDS,
+) -> None:
+    """Patch :func:`pipelines.ingest_games.enumerate_game_ids`.
+
+    Replaces the module-level import with a trivial stub that returns
+    ``list(game_ids)`` regardless of the arguments passed in. This is
+    the canonical seam exploited by every test in this file — it
+    isolates the Games pipeline from the Schedule endpoint so that
+    Games-specific behaviours can be exercised in isolation (AAP
+    §0.4.5 cross-domain dependency: Schedule → Games).
+
+    The target path is ``pipelines.ingest_games.enumerate_game_ids``
+    (not ``endpoints.schedule.enumerate_game_ids``) because the name
+    is bound into the pipeline module's namespace at import time.
+
+    Parameters
+    ----------
+    monkeypatch:
+        The pytest ``monkeypatch`` fixture, scoped to the invoking
+        test. Undoes the patch automatically on test teardown.
+    game_ids:
+        Iterable of GAME_IDs to return. Defaults to ``_GAME_IDS`` (3
+        synthetic IDs). Pass a tuple/list/generator to customise.
+    """
+    ids: List[str] = list(game_ids)
+    monkeypatch.setattr(
+        "pipelines.ingest_games.enumerate_game_ids",
+        lambda client, season: list(ids),
+    )
+
+
+class _SelectiveFailureClient:
+    """Client spy that raises only for specific ``GameID`` values.
+
+    Used by ``TestRule6FailSafe.test_single_game_failure_continues_iteration``
+    to simulate a per-game upstream failure that Rule 6 must isolate.
+    Unlike :class:`RecordingClient.raise_for` (which raises on *every*
+    call to a given endpoint), this spy inspects ``params["GameID"]``
+    so that only the designated game fails while the remaining games
+    receive the configured happy-path response.
+
+    Records call tuples on :attr:`calls` using the same
+    ``(endpoint, params_dict)`` shape as :class:`RecordingClient`, so
+    assertions over ``client.calls`` remain semantically compatible.
+
+    Attributes
+    ----------
+    calls:
+        Running list of ``(endpoint, params)`` tuples observed by
+        :meth:`get` — order-preserving.
+    responses:
+        The endpoint → payload map supplied at construction time.
+    failing_game_ids:
+        Set of GAME_ID strings for which
+        :meth:`get` raises :class:`RuntimeError` when invoked against
+        :attr:`_failing_endpoint`.
+    failing_endpoint:
+        The endpoint name at which failure is simulated. Defaults to
+        ``_BOXSCORE_ENDPOINT`` (the first upstream call per game in
+        the pipeline — making the failure deterministic *before* any
+        write or checkpoint work begins).
+    """
+
+    def __init__(
+        self,
+        responses: Dict[str, Dict[str, Any]],
+        failing_game_ids: Iterable[str],
+        failing_endpoint: str = _BOXSCORE_ENDPOINT,
+    ) -> None:
+        self.responses: Dict[str, Dict[str, Any]] = dict(responses)
+        self.failing_game_ids = set(failing_game_ids)
+        self.failing_endpoint = str(failing_endpoint)
+        self.calls: List[tuple] = []
+
+    def get(
+        self, endpoint: str, params: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """Record the call then return a payload or raise per failure config."""
+        self.calls.append((str(endpoint), dict(params or {})))
+        game_id = (params or {}).get("GameID")
+        if endpoint == self.failing_endpoint and game_id in self.failing_game_ids:
+            raise RuntimeError(
+                f"simulated {endpoint} failure for GAME_ID={game_id}"
+            )
+        if endpoint in self.responses:
+            return self.responses[endpoint]
+        return {
+            "resultSets": [
+                {
+                    "name": str(endpoint),
+                    "headers": ["A"],
+                    "rowSet": [[1]],
+                }
+            ]
+        }
+
+
+# ---------------------------------------------------------------------------
+# Test 1 — Happy path (3 games, all successful)
+# ---------------------------------------------------------------------------
+
+
+def test_run_happy_path_writes_games_and_marks_each_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+    recording_client,
+    recording_writer,
+    recording_checkpoint,
+    sample_multi_table_payload: Dict[str, Any],
+    sample_playbyplay_payload: Dict[str, Any],
+    tmp_path,
+) -> None:
+    """Happy path: 3 games produce 6 writes, 3 marks, 6 row-metric increments.
+
+    With 3 GAME_IDs from the stubbed enumerator and both endpoints
+    returning canonical sample payloads, the pipeline must:
+
+    - Call the client exactly 2× per game (one boxscore, one PBP) ⇒ 6 total
+    - Call the writer exactly 2× per game (games, play_by_play) ⇒ 6 total
+    - Record cumulative row counts: games rows grow 2 → 4 → 6, PBP rows
+      grow 3 → 6 → 9 (the sample payloads deliver 2 box-score rows and
+      3 play-by-play rows per game after flattening)
+    - Mark-complete exactly 3× (one per successful GAME_ID)
+    - Increment ``pipeline_rows_written_total`` exactly 6 times with
+      the per-game single-frame row count (``n=2`` for games rows,
+      ``n=3`` for play-by-play rows) — never the cumulative value.
+    """
+    # --- Arrange -------------------------------------------------------
+    _patch_enumerate(monkeypatch, _GAME_IDS)
+    client = recording_client(
+        responses={
+            _BOXSCORE_ENDPOINT: sample_multi_table_payload,
+            _PLAYBYPLAY_ENDPOINT: sample_playbyplay_payload,
+        },
+    )
+    writer = recording_writer(tmp_path)
+    checkpoint = recording_checkpoint()
+    metrics_mock = MagicMock()
+
+    # --- Act -----------------------------------------------------------
+    ingest_games.run(
+        client=client,
+        writer=writer,
+        checkpoint=checkpoint,
+        season=_SEASON,
+        metrics=metrics_mock,
+    )
+
+    # --- Assert: client calls -----------------------------------------
+    # 2 endpoints per game × 3 games = 6 calls, alternating per game.
+    assert len(client.calls) == 6, (
+        f"expected 6 client.get calls (2 endpoints × 3 games); "
+        f"got {len(client.calls)}: {client.calls!r}"
+    )
+    for i, gid in enumerate(_GAME_IDS):
+        # Per-game ordering: boxscore then playbyplay.
+        assert client.calls[2 * i][0] == _BOXSCORE_ENDPOINT, (
+            f"game index {i}: expected call {2 * i} to be boxscore, "
+            f"got {client.calls[2 * i]!r}"
+        )
+        assert client.calls[2 * i][1].get("GameID") == gid, (
+            f"game index {i}: boxscore call must carry GameID={gid}, "
+            f"got params={client.calls[2 * i][1]!r}"
+        )
+        assert client.calls[2 * i + 1][0] == _PLAYBYPLAY_ENDPOINT, (
+            f"game index {i}: expected call {2 * i + 1} to be PBP, "
+            f"got {client.calls[2 * i + 1]!r}"
+        )
+        assert client.calls[2 * i + 1][1].get("GameID") == gid, (
+            f"game index {i}: PBP call must carry GameID={gid}, "
+            f"got params={client.calls[2 * i + 1][1]!r}"
+        )
+
+    # --- Assert: writer calls (cumulative buffer pattern) -------------
+    # The games pipeline re-writes BOTH artifacts after every successful
+    # game, with a monotonically-growing cumulative buffer. So for 3
+    # games we expect 6 writes: [games(2), pbp(3), games(4), pbp(6),
+    # games(6), pbp(9)].
+    assert len(writer.writes) == 6, (
+        f"expected 6 writer.write calls (2 per game × 3 games); "
+        f"got {len(writer.writes)}: {[w['name'] for w in writer.writes]!r}"
+    )
+    # Alternating artifact names: games, pbp, games, pbp, games, pbp.
+    for i, write in enumerate(writer.writes):
+        expected_name = (
+            config.CSV_GAMES if i % 2 == 0 else config.CSV_PLAY_BY_PLAY
+        )
+        assert write["name"] == expected_name, (
+            f"writer.writes[{i}] name mismatch: expected {expected_name!r}, "
+            f"got {write['name']!r}"
+        )
+        assert write["season"] == _SEASON, (
+            f"writer.writes[{i}] season mismatch: expected {_SEASON!r}, "
+            f"got {write['season']!r}"
+        )
+    # Row-count monotonicity (cumulative): each artifact's row count
+    # must be non-decreasing across its writes.
+    games_writes = [w for w in writer.writes if w["name"] == config.CSV_GAMES]
+    pbp_writes = [w for w in writer.writes if w["name"] == config.CSV_PLAY_BY_PLAY]
+    assert len(games_writes) == 3, (
+        f"expected 3 games-CSV writes; got {len(games_writes)}"
+    )
+    assert len(pbp_writes) == 3, (
+        f"expected 3 play_by_play-CSV writes; got {len(pbp_writes)}"
+    )
+    prev_games_rows = 0
+    for i, w in enumerate(games_writes):
+        assert w["rows"] >= prev_games_rows, (
+            f"games-CSV row count regressed at write {i}: "
+            f"{w['rows']} < previous {prev_games_rows}"
+        )
+        prev_games_rows = w["rows"]
+    prev_pbp_rows = 0
+    for i, w in enumerate(pbp_writes):
+        assert w["rows"] >= prev_pbp_rows, (
+            f"PBP-CSV row count regressed at write {i}: "
+            f"{w['rows']} < previous {prev_pbp_rows}"
+        )
+        prev_pbp_rows = w["rows"]
+
+    # --- Assert: checkpoint marks -------------------------------------
+    # Exactly one mark per game, in iteration order, with the correct
+    # domain/key schema.
+    expected_marks = [(config.DOMAIN_GAMES, gid) for gid in _GAME_IDS]
+    assert checkpoint.marks == expected_marks, (
+        f"expected marks={expected_marks!r}; got {checkpoint.marks!r}"
+    )
+
+    # --- Assert: get_pending probe ------------------------------------
+    # Pipeline must consult the checkpoint's pending list ONCE at top
+    # of run(). The RecordingCheckpoint records the ``(domain, tuple)``
+    # shape of the call.
+    assert len(checkpoint.pendings) == 1, (
+        f"expected exactly 1 get_pending probe; "
+        f"got {len(checkpoint.pendings)}: {checkpoint.pendings!r}"
+    )
+    assert checkpoint.pendings[0] == (config.DOMAIN_GAMES, tuple(_GAME_IDS)), (
+        f"expected get_pending probe=({config.DOMAIN_GAMES!r}, "
+        f"{tuple(_GAME_IDS)!r}); got {checkpoint.pendings[0]!r}"
+    )
+
+    # --- Assert: row-written metric increments ------------------------
+    # Expect 6 inc calls to "pipeline_rows_written_total": 3 with file=games
+    # and 3 with file=play_by_play, each carrying the single-game row
+    # count under the ``n=`` kwarg (NOT the cumulative count).
+    row_inc_calls = [
+        c
+        for c in metrics_mock.inc.call_args_list
+        if c.args and c.args[0] == "pipeline_rows_written_total"
+    ]
+    assert len(row_inc_calls) == 6, (
+        f"expected 6 pipeline_rows_written_total inc calls; "
+        f"got {len(row_inc_calls)}: {row_inc_calls!r}"
+    )
+    games_inc = [
+        c
+        for c in row_inc_calls
+        if c.args[1] == {"domain": config.DOMAIN_GAMES, "file": config.CSV_GAMES}
+    ]
+    pbp_inc = [
+        c
+        for c in row_inc_calls
+        if c.args[1]
+        == {"domain": config.DOMAIN_GAMES, "file": config.CSV_PLAY_BY_PLAY}
+    ]
+    assert len(games_inc) == 3, (
+        f"expected 3 inc calls with file={config.CSV_GAMES!r}; "
+        f"got {len(games_inc)}"
+    )
+    assert len(pbp_inc) == 3, (
+        f"expected 3 inc calls with file={config.CSV_PLAY_BY_PLAY!r}; "
+        f"got {len(pbp_inc)}"
+    )
+    # Each row-inc call must carry an ``n`` kwarg (per-game delta,
+    # never the cumulative total).
+    for c in row_inc_calls:
+        assert "n" in c.kwargs, (
+            f"pipeline_rows_written_total inc must use ``n=`` kwarg; "
+            f"got args={c.args!r}, kwargs={c.kwargs!r}"
+        )
+        assert c.kwargs["n"] > 0, (
+            f"``n=`` must be positive; got {c.kwargs['n']!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Test 2 — Idempotent skip
+# ---------------------------------------------------------------------------
+
+
+def test_run_idempotent_skip_when_all_games_checkpointed(
+    monkeypatch: pytest.MonkeyPatch,
+    recording_client,
+    recording_writer,
+    recording_checkpoint,
+    sample_multi_table_payload: Dict[str, Any],
+    sample_playbyplay_payload: Dict[str, Any],
+    tmp_path,
+) -> None:
+    """Pre-seeded checkpoint ⇒ zero fetches, zero writes, zero marks.
+
+    If every GAME_ID is already present in the checkpoint (via a prior
+    successful run), :func:`CheckpointManager.get_pending` returns an
+    empty list and the pipeline's early-return branch kicks in (see
+    ``ingest_games.py`` lines 483-490: ``if not pending: return``).
+
+    This test verifies:
+      - ``client.get`` is never called;
+      - ``writer.write`` is never called;
+      - ``checkpoint.mark_completed`` is never called (no new marks);
+      - ``checkpoint.get_pending`` **is** called once — that's how the
+        skip is decided.
+    """
+    # --- Arrange -------------------------------------------------------
+    _patch_enumerate(monkeypatch, _GAME_IDS)
+    client = recording_client(
+        responses={
+            _BOXSCORE_ENDPOINT: sample_multi_table_payload,
+            _PLAYBYPLAY_ENDPOINT: sample_playbyplay_payload,
+        },
+    )
+    writer = recording_writer(tmp_path)
+    checkpoint = recording_checkpoint(
+        completed={config.DOMAIN_GAMES: list(_GAME_IDS)},
+    )
+    metrics_mock = MagicMock()
+
+    # --- Act -----------------------------------------------------------
+    ingest_games.run(
+        client=client,
+        writer=writer,
+        checkpoint=checkpoint,
+        season=_SEASON,
+        metrics=metrics_mock,
+    )
+
+    # --- Assert --------------------------------------------------------
+    assert client.calls == [], (
+        f"client must not be called when all games are checkpointed; "
+        f"got {client.calls!r}"
+    )
+    assert writer.writes == [], (
+        f"writer must not be called when all games are checkpointed; "
+        f"got {writer.writes!r}"
+    )
+    assert checkpoint.marks == [], (
+        f"no mark_completed calls expected on an idempotent resume; "
+        f"got {checkpoint.marks!r}"
+    )
+    # But get_pending IS observed — that's how the skip was decided.
+    assert len(checkpoint.pendings) == 1, (
+        f"expected exactly one get_pending probe; "
+        f"got {len(checkpoint.pendings)}: {checkpoint.pendings!r}"
+    )
+    assert checkpoint.pendings[0] == (config.DOMAIN_GAMES, tuple(_GAME_IDS)), (
+        f"expected get_pending probe=({config.DOMAIN_GAMES!r}, "
+        f"{tuple(_GAME_IDS)!r}); got {checkpoint.pendings[0]!r}"
+    )
+    # No row-written metric increments should fire on a skip.
+    row_inc_calls = [
+        c
+        for c in metrics_mock.inc.call_args_list
+        if c.args and c.args[0] == "pipeline_rows_written_total"
+    ]
+    assert row_inc_calls == [], (
+        f"no row-written metric increments expected on idempotent resume; "
+        f"got {row_inc_calls!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 3 — Rule 5 ordering (mark_completed follows writes per game)
+# ---------------------------------------------------------------------------
+
+
+def test_rule5_mark_completed_follows_writes_per_game(
+    monkeypatch: pytest.MonkeyPatch,
+    recording_client,
+    recording_writer,
+    recording_checkpoint,
+    sample_multi_table_payload: Dict[str, Any],
+    sample_playbyplay_payload: Dict[str, Any],
+    tmp_path,
+) -> None:
+    """Rule 5: ``mark_completed`` must follow ``writer.write`` per game.
+
+    Rule 5 (AAP §0.7.2.5) requires that the checkpoint be marked
+    *immediately after* the successful CSV write — never before.
+    Because the Games pipeline writes *both* CSVs (games and PBP)
+    before marking, this test verifies the exact interleaving:
+
+    Expected per-game sequence (over 3 games):
+      write(games, g1) → write(pbp, g1) → mark(g1)
+      → write(games, g2) → write(pbp, g2) → mark(g2)
+      → write(games, g3) → write(pbp, g3) → mark(g3)
+
+    The :class:`RecordingWriter` and :class:`RecordingCheckpoint`
+    spies do not share a unified event log, so we reconstruct the
+    ordering by counting: after N marks, there must be exactly 2N
+    writes.
+    """
+    # --- Arrange -------------------------------------------------------
+    _patch_enumerate(monkeypatch, _GAME_IDS)
+    client = recording_client(
+        responses={
+            _BOXSCORE_ENDPOINT: sample_multi_table_payload,
+            _PLAYBYPLAY_ENDPOINT: sample_playbyplay_payload,
+        },
+    )
+    writer = recording_writer(tmp_path)
+    checkpoint = recording_checkpoint()
+
+    # --- Act -----------------------------------------------------------
+    ingest_games.run(
+        client=client,
+        writer=writer,
+        checkpoint=checkpoint,
+        season=_SEASON,
+    )
+
+    # --- Assert: exact tally -----------------------------------------
+    # For N games successfully processed, 2N writes and N marks.
+    assert len(writer.writes) == 2 * len(_GAME_IDS), (
+        f"expected {2 * len(_GAME_IDS)} writes; got {len(writer.writes)}"
+    )
+    assert len(checkpoint.marks) == len(_GAME_IDS), (
+        f"expected {len(_GAME_IDS)} marks; got {len(checkpoint.marks)}: "
+        f"{checkpoint.marks!r}"
+    )
+    # Verify marks arrive in GAME_ID order (reflects the per-game
+    # control flow — not an incidental quirk of the spy).
+    assert checkpoint.marks == [
+        (config.DOMAIN_GAMES, gid) for gid in _GAME_IDS
+    ], f"mark order diverged; got {checkpoint.marks!r}"
+
+    # --- Assert: get_pending precedes any write ----------------------
+    # Rule 5 also requires the pending probe to precede the per-game
+    # loop. With a single get_pending call recorded, and 2N writes
+    # recorded afterwards, the invariant holds.
+    assert len(checkpoint.pendings) == 1, (
+        f"expected exactly one get_pending probe; "
+        f"got {len(checkpoint.pendings)}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 4 — Negative-space guard (forbidden endpoints)
+# ---------------------------------------------------------------------------
+
+
+def test_no_forbidden_endpoints_are_invoked(
+    monkeypatch: pytest.MonkeyPatch,
+    recording_client,
+    recording_writer,
+    recording_checkpoint,
+    sample_multi_table_payload: Dict[str, Any],
+    sample_playbyplay_payload: Dict[str, Any],
+    tmp_path,
+) -> None:
+    """Games pipeline must only invoke ``boxscoretraditionalv2`` and ``playbyplayv2``.
+
+    This negative-space assertion protects against future regressions
+    where the Games pipeline might be "helpfully" extended to invoke
+    endpoints owned by other domains (e.g. ``leaguegamefinder`` from
+    Schedule, ``leaguedashteamstats`` from Teams, or
+    ``leaguedashlineups`` from Lineups). The set of forbidden
+    endpoints below covers the other 14 endpoints registered in
+    :mod:`endpoints` — see ``endpoints/__init__.py::__all__``.
+    """
+    # --- Arrange -------------------------------------------------------
+    _patch_enumerate(monkeypatch, _GAME_IDS)
+    client = recording_client(
+        responses={
+            _BOXSCORE_ENDPOINT: sample_multi_table_payload,
+            _PLAYBYPLAY_ENDPOINT: sample_playbyplay_payload,
+        },
+    )
+    writer = recording_writer(tmp_path)
+    checkpoint = recording_checkpoint()
+
+    # --- Act -----------------------------------------------------------
+    ingest_games.run(
+        client=client,
+        writer=writer,
+        checkpoint=checkpoint,
+        season=_SEASON,
+    )
+
+    # --- Assert --------------------------------------------------------
+    forbidden_endpoints = {
+        # Schedule domain
+        "leaguegamefinder",
+        # Teams domain
+        "leaguedashteamstats",
+        "teamgamelog",
+        "teamdashboardbygeneralsplits",
+        # Players domain
+        "leaguedashplayerstats",
+        "leaguedashplayerclutch",
+        "playercareerstats",
+        "playergamelog",
+        "leaguedashptstats",
+        # Lineups domain
+        "leaguedashlineups",
+        "leaguedashplayerclutch_onoff",
+        # Other Games endpoints NOT used by this pipeline's primary path
+        "scoreboardv2",
+        "boxscoreadvancedv2",
+    }
+    called_endpoints = {call[0] for call in client.calls}
+    overlap = forbidden_endpoints & called_endpoints
+    assert not overlap, (
+        f"games pipeline must not invoke {overlap!r}; "
+        f"got client.calls endpoints={called_endpoints!r}"
+    )
+    # Affirmative: only the two permitted endpoints appear.
+    assert called_endpoints == {_BOXSCORE_ENDPOINT, _PLAYBYPLAY_ENDPOINT}, (
+        f"expected only {{{_BOXSCORE_ENDPOINT!r}, {_PLAYBYPLAY_ENDPOINT!r}}}; "
+        f"got {called_endpoints!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Rule 6 CANARY Suite — AAP §0.7.2.6
+# ---------------------------------------------------------------------------
+
+
+class TestRule6FailSafe:
+    """Rule 6 Canary — the most important test class in this file.
+
+    Rule 6 (AAP §0.7.2.6) states that the Games pipeline — and *only*
+    the Games pipeline — wraps its per-``GAME_ID`` body in
+    ``try/except Exception`` so that a failure fetching, normalising,
+    writing, or checkpointing *one* game does not abort the entire
+    season. The handler's responsibilities, as implemented at
+    ``ingest_games.py`` lines 565-570, are exactly four actions:
+
+      1. Increment the local ``failed`` counter (used only for the
+         final log line).
+      2. Emit a WARNING log with the format string
+         ``"game %s failed: %s"`` carrying the failing GAME_ID and
+         the exception.
+      3. Increment ``games_failed_total`` with the positional label
+         dict ``{"game_id": gid}`` (no ``n=`` kwarg — the default
+         increment of 1 applies).
+      4. ``continue`` — skip to the next GAME_ID without marking the
+         checkpoint, without re-raising, and without writing the
+         current game's partial buffer contents.
+
+    These tests exercise three distinct scenarios to prevent
+    regression:
+      - *Single game failure* — boundary conditions around the
+        successful games on either side of the failing one.
+      - *Blanket failure* — every game fails; pipeline still
+        completes gracefully with ``processed=0 failed=N``.
+      - *Rule 6 scope* — failures *outside* the per-game body
+        (specifically, in ``enumerate_game_ids``) propagate verbatim.
+    """
+
+    # -----------------------------------------------------------------
+    # Rule 6 — single game failure (G2 fails, G1 and G3 succeed)
+    # -----------------------------------------------------------------
+
+    def test_single_game_failure_continues_iteration(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        recording_writer,
+        recording_checkpoint,
+        sample_multi_table_payload: Dict[str, Any],
+        sample_playbyplay_payload: Dict[str, Any],
+        tmp_path,
+    ) -> None:
+        """G2 boxscore raises ⇒ G1 and G3 still process; only G2 marked failed.
+
+        Uses :class:`_SelectiveFailureClient` to simulate an upstream
+        failure on exactly one GAME_ID. The pipeline must:
+          - not re-raise
+          - invoke the boxscore endpoint for every GAME_ID (3 calls)
+          - invoke the PBP endpoint for only G1 and G3 (2 calls) —
+            G2 bails before reaching PBP
+          - write exactly 4 CSVs (2 per successful game)
+          - mark only G1 and G3
+          - increment ``games_failed_total`` exactly once with
+            ``{"game_id": "<G2>"}``
+          - emit exactly one WARNING log matching ``"game %s failed: %s"``
+            with G2's ID.
+        """
+        # --- Arrange ---------------------------------------------------
+        _patch_enumerate(monkeypatch, _GAME_IDS)
+        failing_gid = _GAME_IDS[1]
+        client = _SelectiveFailureClient(
+            responses={
+                _BOXSCORE_ENDPOINT: sample_multi_table_payload,
+                _PLAYBYPLAY_ENDPOINT: sample_playbyplay_payload,
+            },
+            failing_game_ids=[failing_gid],
+        )
+        writer = recording_writer(tmp_path)
+        checkpoint = recording_checkpoint()
+        metrics_mock = MagicMock()
+        logger_mock = MagicMock()
+
+        # --- Act — MUST NOT RAISE -------------------------------------
+        try:
+            ingest_games.run(
+                client=client,
+                writer=writer,
+                checkpoint=checkpoint,
+                season=_SEASON,
+                logger=logger_mock,
+                metrics=metrics_mock,
+            )
+        except Exception as exc:
+            pytest.fail(
+                f"Rule 6 violated: per-game failure propagated to caller: "
+                f"{exc!r}"
+            )
+
+        # --- Assert: client was called for each game's boxscore ------
+        boxscore_calls = [c for c in client.calls if c[0] == _BOXSCORE_ENDPOINT]
+        assert len(boxscore_calls) == 3, (
+            f"expected boxscore fetch for every GAME_ID (3 calls); "
+            f"got {len(boxscore_calls)}: {boxscore_calls!r}"
+        )
+        # PBP is only invoked for the two successful games.
+        pbp_calls = [c for c in client.calls if c[0] == _PLAYBYPLAY_ENDPOINT]
+        pbp_gids = {c[1].get("GameID") for c in pbp_calls}
+        assert pbp_gids == {_GAME_IDS[0], _GAME_IDS[2]}, (
+            f"PBP must be fetched only for successful games; "
+            f"got PBP GAME_IDs={pbp_gids!r}"
+        )
+
+        # --- Assert: writer invoked only for successful games --------
+        # 2 writes per successful game × 2 successful games = 4 writes.
+        assert len(writer.writes) == 4, (
+            f"expected 4 writes (2 successful games × 2 artifacts); "
+            f"got {len(writer.writes)}: "
+            f"{[w['name'] for w in writer.writes]!r}"
+        )
+        # All writes carry season propagation.
+        for w in writer.writes:
+            assert w["season"] == _SEASON
+            assert w["name"] in {config.CSV_GAMES, config.CSV_PLAY_BY_PLAY}
+
+        # --- Assert: checkpoint marks exclude the failing game -------
+        # G2 was skipped mid-try-block and must NOT appear in marks.
+        assert checkpoint.marks == [
+            (config.DOMAIN_GAMES, _GAME_IDS[0]),
+            (config.DOMAIN_GAMES, _GAME_IDS[2]),
+        ], (
+            f"expected marks for G1 and G3 only (G2 failed); "
+            f"got {checkpoint.marks!r}"
+        )
+        # Failing game must not leak into the marks list via any path.
+        assert (config.DOMAIN_GAMES, failing_gid) not in checkpoint.marks, (
+            f"failing GAME_ID {failing_gid!r} must not be checkpointed; "
+            f"got marks={checkpoint.marks!r}"
+        )
+
+        # --- Assert: games_failed_total incremented for G2 only ------
+        failed_inc_calls = [
+            c
+            for c in metrics_mock.inc.call_args_list
+            if c.args and c.args[0] == "games_failed_total"
+        ]
+        assert len(failed_inc_calls) == 1, (
+            f"expected exactly 1 games_failed_total inc call; "
+            f"got {len(failed_inc_calls)}: {failed_inc_calls!r}"
+        )
+        failed_call = failed_inc_calls[0]
+        # Labels: must be positional, {"game_id": <failing_gid>},
+        # with NO ``n=`` kwarg (the default of 1 is implicit — see
+        # ingest_games.py line 569: met.inc("games_failed_total",
+        # {"game_id": gid}).
+        assert failed_call.args[1] == {"game_id": failing_gid}, (
+            f"games_failed_total labels mismatch; "
+            f"expected {{'game_id': {failing_gid!r}}}; "
+            f"got {failed_call.args[1]!r}"
+        )
+        assert "n" not in failed_call.kwargs, (
+            f"games_failed_total must be incremented positionally without "
+            f"``n=`` kwarg; got kwargs={failed_call.kwargs!r}"
+        )
+
+        # --- Assert: exactly one WARNING log with Rule 6 format ------
+        warning_calls = logger_mock.warning.call_args_list
+        assert len(warning_calls) == 1, (
+            f"expected exactly 1 log.warning call for the failing game; "
+            f"got {len(warning_calls)}: {warning_calls!r}"
+        )
+        fmt, *args = warning_calls[0].args
+        assert fmt == "game %s failed: %s", (
+            f"Rule 6 WARNING format string mismatch; "
+            f"expected 'game %%s failed: %%s'; got {fmt!r}"
+        )
+        assert args[0] == failing_gid, (
+            f"WARNING first positional arg must be failing GAME_ID; "
+            f"expected {failing_gid!r}; got {args[0]!r}"
+        )
+
+    # -----------------------------------------------------------------
+    # Rule 6 — blanket failure (all games fail)
+    # -----------------------------------------------------------------
+
+    def test_all_games_fail_does_not_abort_pipeline(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        recording_client,
+        recording_writer,
+        recording_checkpoint,
+        sample_playbyplay_payload: Dict[str, Any],
+        tmp_path,
+    ) -> None:
+        """Blanket failure: every game raises ⇒ pipeline completes gracefully.
+
+        Uses the conftest :class:`RecordingClient.raise_for` mechanism
+        (raises on *every* call to a given endpoint regardless of
+        params) to simulate a transient upstream outage where
+        ``boxscoretraditionalv2`` is entirely unreachable.
+
+        The pipeline must:
+          - not re-raise (Rule 6 fail-safe active for *every* game)
+          - never call the writer (boxscore fetch fails before any
+            write is attempted)
+          - never mark any game completed
+          - increment ``games_failed_total`` exactly 3 times (once per
+            GAME_ID) with distinct ``{"game_id": <gid>}`` label dicts
+          - emit exactly 3 WARNING log records
+          - still emit the final ``pipeline.complete`` log (reached
+            because Rule 6 ``continue`` short-circuits each game).
+        """
+        # --- Arrange ---------------------------------------------------
+        _patch_enumerate(monkeypatch, _GAME_IDS)
+        client = recording_client(
+            responses={_PLAYBYPLAY_ENDPOINT: sample_playbyplay_payload},
+            raise_for={
+                _BOXSCORE_ENDPOINT: RuntimeError(
+                    "simulated boxscoretraditionalv2 outage"
+                ),
+            },
+        )
+        writer = recording_writer(tmp_path)
+        checkpoint = recording_checkpoint()
+        metrics_mock = MagicMock()
+        logger_mock = MagicMock()
+
+        # --- Act — MUST NOT RAISE -------------------------------------
+        try:
+            ingest_games.run(
+                client=client,
+                writer=writer,
+                checkpoint=checkpoint,
+                season=_SEASON,
+                logger=logger_mock,
+                metrics=metrics_mock,
+            )
+        except Exception as exc:
+            pytest.fail(
+                f"Rule 6 violated: blanket failure propagated to caller: "
+                f"{exc!r}"
+            )
+
+        # --- Assert: only boxscore was attempted (3×) ----------------
+        # PBP should never be reached because boxscore raises first.
+        boxscore_calls = [c for c in client.calls if c[0] == _BOXSCORE_ENDPOINT]
+        pbp_calls = [c for c in client.calls if c[0] == _PLAYBYPLAY_ENDPOINT]
+        assert len(boxscore_calls) == 3, (
+            f"expected boxscore attempted for every game (3×); "
+            f"got {len(boxscore_calls)}"
+        )
+        assert pbp_calls == [], (
+            f"PBP must never be reached when boxscore fails first; "
+            f"got {pbp_calls!r}"
+        )
+
+        # --- Assert: writer never invoked ----------------------------
+        assert writer.writes == [], (
+            f"writer must not be called when all games fail; "
+            f"got {writer.writes!r}"
+        )
+
+        # --- Assert: no checkpoint marks -----------------------------
+        assert checkpoint.marks == [], (
+            f"no game was successful ⇒ no marks expected; "
+            f"got {checkpoint.marks!r}"
+        )
+
+        # --- Assert: games_failed_total incremented 3× ---------------
+        failed_inc_calls = [
+            c
+            for c in metrics_mock.inc.call_args_list
+            if c.args and c.args[0] == "games_failed_total"
+        ]
+        assert len(failed_inc_calls) == 3, (
+            f"expected 3 games_failed_total inc calls; "
+            f"got {len(failed_inc_calls)}: {failed_inc_calls!r}"
+        )
+        # Each failing GAME_ID must appear exactly once in the label set.
+        failed_gids = {c.args[1]["game_id"] for c in failed_inc_calls}
+        assert failed_gids == set(_GAME_IDS), (
+            f"failed GAME_IDs mismatch; expected {set(_GAME_IDS)!r}; "
+            f"got {failed_gids!r}"
+        )
+
+        # --- Assert: 3 WARNING logs with Rule 6 format ---------------
+        warning_calls = logger_mock.warning.call_args_list
+        assert len(warning_calls) == 3, (
+            f"expected 3 WARNING logs (one per failing game); "
+            f"got {len(warning_calls)}"
+        )
+        for call in warning_calls:
+            fmt = call.args[0]
+            assert fmt == "game %s failed: %s", (
+                f"Rule 6 WARNING format mismatch; got {fmt!r}"
+            )
+            # First positional arg after format is the GAME_ID.
+            assert call.args[1] in _GAME_IDS, (
+                f"WARNING GAME_ID arg must be one of {_GAME_IDS!r}; "
+                f"got {call.args[1]!r}"
+            )
+
+    # -----------------------------------------------------------------
+    # Rule 6 scope — enumerate_game_ids failure propagates
+    # -----------------------------------------------------------------
+
+    def test_enumerate_game_ids_failure_propagates_past_rule6(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        recording_client,
+        recording_writer,
+        recording_checkpoint,
+        tmp_path,
+    ) -> None:
+        """Rule 6 scope: ``enumerate_game_ids`` failures are NOT swallowed.
+
+        AAP §0.7.2.6 scopes the Rule 6 ``try/except`` to the per-game
+        body *only*. Per the ingest_games.py docstring (lines 375-389,
+        "Fatal conditions (propagated — NOT wrapped by Rule 6)"), a
+        failure in :func:`endpoints.schedule.enumerate_game_ids` must
+        propagate to the caller unchanged — the pipeline has no work
+        to do when the schedule cannot be enumerated, so retrying on
+        the next run is the correct recovery.
+
+        This test simulates that scenario by monkey-patching
+        ``enumerate_game_ids`` to raise :class:`RuntimeError` and
+        asserts that:
+          - the exception reaches the caller verbatim (with identical
+            message for traceability)
+          - no client calls, writes, or marks occur
+          - no WARNING log is emitted (Rule 6's ``log.warning`` is
+            per-game, not pipeline-level)
+          - ``games_failed_total`` is NOT incremented (it, too, is
+            per-game).
+        """
+
+        # --- Arrange ---------------------------------------------------
+        def _boom(_client, _season):
+            raise RuntimeError("simulated enumerate_game_ids transport failure")
+
+        monkeypatch.setattr(
+            "pipelines.ingest_games.enumerate_game_ids", _boom
+        )
+        client = recording_client()
+        writer = recording_writer(tmp_path)
+        checkpoint = recording_checkpoint()
+        metrics_mock = MagicMock()
+        logger_mock = MagicMock()
+
+        # --- Act — MUST RAISE (Rule 6 does NOT wrap this scope) ------
+        with pytest.raises(RuntimeError) as excinfo:
+            ingest_games.run(
+                client=client,
+                writer=writer,
+                checkpoint=checkpoint,
+                season=_SEASON,
+                logger=logger_mock,
+                metrics=metrics_mock,
+            )
+        assert "simulated enumerate_game_ids transport failure" in str(
+            excinfo.value
+        ), (
+            f"expected the original RuntimeError message to propagate "
+            f"unchanged; got {excinfo.value!r}"
+        )
+
+        # --- Assert: no downstream side effects observed -------------
+        assert client.calls == [], (
+            f"no HTTP work should occur when enumeration fails; "
+            f"got {client.calls!r}"
+        )
+        assert writer.writes == [], (
+            f"no writes should occur when enumeration fails; "
+            f"got {writer.writes!r}"
+        )
+        assert checkpoint.marks == [], (
+            f"no marks should occur when enumeration fails; "
+            f"got {checkpoint.marks!r}"
+        )
+        # No per-game WARNING — enumeration failure is pipeline-level,
+        # not per-game.
+        assert logger_mock.warning.call_args_list == [], (
+            f"no per-game WARNING expected; "
+            f"got {logger_mock.warning.call_args_list!r}"
+        )
+        # No games_failed_total bump — Rule 6 is scoped to per-game.
+        failed_inc_calls = [
+            c
+            for c in metrics_mock.inc.call_args_list
+            if c.args and c.args[0] == "games_failed_total"
+        ]
+        assert failed_inc_calls == [], (
+            f"games_failed_total must NOT be incremented when the failure "
+            f"is outside the per-game body; got {failed_inc_calls!r}"
+        )
