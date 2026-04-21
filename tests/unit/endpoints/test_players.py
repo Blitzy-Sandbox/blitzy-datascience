@@ -1,998 +1,390 @@
-"""
-Unit tests for ``endpoints.players`` — the thin wrapper layer that packages
-the NBA Stats API's five Players endpoints (F-009) as single-purpose Python
-callables.
+"""Unit tests for :mod:`endpoints.players` (F-009 Players domain).
 
-Feature Coverage
-================
-Per AAP §0.5.1.4 and §0.7.2 (Rules 1, 3, 7), the module under test exposes
-exactly five public wrappers, each forwarding a single ``NBAClient.get`` call
-with a domain-specific parameter dictionary:
+This module verifies the FIVE public Players-domain endpoint wrappers defined in
+``endpoints/players.py``:
 
-- ``fetch_leaguedashplayerstats`` — ``leaguedashplayerstats`` endpoint, 36 keys
-- ``fetch_leaguedashplayerclutch`` — ``leaguedashplayerclutch`` endpoint,
-  38 keys (OMITS ``TwoWay``; adds ``ClutchTime``, ``AheadBehind``, ``PointDiff``)
-- ``fetch_playercareerstats`` — ``playercareerstats`` endpoint, strict 3 keys
-  (``PlayerID`` str-cast, ``PerMode``, ``LeagueID``) — **no ``Season``**
-- ``fetch_playergamelog`` — ``playergamelog`` endpoint, strict 6 keys
-  (``PlayerID`` str-cast, ``Season``, ``SeasonType``, ``LeagueID``,
-  ``DateFrom``, ``DateTo``)
-- ``fetch_leaguedashptstats`` — ``leaguedashptstats`` endpoint, 29 keys
-  (includes ``PtMeasureType``, ``PlayerOrTeam``; omits ``MeasureType``,
-  ``PlusMinus``, ``PaceAdjust``, ``Rank``, ``Period``, ``PORound``,
-  ``GameSegment``, ``ShotClockRange``, ``TwoWay``)
+* :func:`endpoints.players.fetch_leaguedashplayerstats`
+* :func:`endpoints.players.fetch_leaguedashplayerclutch`
+* :func:`endpoints.players.fetch_playercareerstats`   (**NO ``season`` parameter**)
+* :func:`endpoints.players.fetch_playergamelog`
+* :func:`endpoints.players.fetch_leaguedashptstats`
 
-Coverage Matrix
----------------
-For every wrapper each test class asserts:
+Contract aspects covered by the 20 test functions in this module
+----------------------------------------------------------------
+1. **Correct upstream endpoint name** — each wrapper delegates to
+   ``client.get(...)`` with the exact NBA Stats endpoint string
+   (``"leaguedashplayerstats"``, ``"leaguedashplayerclutch"``,
+   ``"playercareerstats"``, ``"playergamelog"``, ``"leaguedashptstats"``).
+2. **Required param surface** — ``Season``, ``SeasonType``, ``LeagueID`` for the
+   league-wide endpoints; ``PlayerID`` for the per-player endpoints.
+3. **Documented defaults** — ``PerMode="PerGame"``, ``MeasureType="Base"``,
+   ``PlayerOrTeam="Player"``, ``PointDiff="5"``, ``ClutchTime="Last 5 Minutes"``,
+   ``AheadBehind="Ahead or Behind"`` propagate into the request params when the
+   caller does not override them.
+4. **Signature exception (playercareerstats)** — the endpoint returns a player's
+   ENTIRE career, so the wrapper MUST NOT emit a ``Season`` key. A dedicated
+   regression guard enforces this.
+5. **Defensive type coercion** — integer ``player_id`` inputs are cast to
+   :class:`str` via ``str(player_id)`` inside the wrapper.
+6. **``**kwargs`` override precedence** — title-case kwargs (e.g.
+   ``MeasureType="Advanced"``) merged via ``params.update(kwargs)`` override the
+   wrapper-owned defaults.
+7. **Pure pass-through** — wrappers return the raw dict from ``client.get``
+   UNMODIFIED (no flattening, no filtering, no transformation).
 
-1. **Endpoint name routing** — ``client.get`` is invoked with the exact NBA
-   Stats endpoint string (no aliasing, no transformation).
-2. **Param dict construction** — the param dict populates the NBA Stats API's
-   expected ``PascalCase`` keys with the wrapper's resolved values.
-3. **Default-argument propagation from config** — unspecified optional
-   arguments fall through to :mod:`config` constants (``DEFAULT_SEASON_TYPE``,
-   ``DEFAULT_LEAGUE_ID``), preserving the upstream authority defined in
-   AAP §0.5.1.1.
-4. **``**kwargs`` override** — any caller-supplied kwargs override the
-   wrapper's literal defaults, allowing callers to specialize the param
-   surface without touching the config layer.
-5. **PlayerID type coercion** — the two wrappers that accept a ``player_id``
-   argument (``fetch_playercareerstats``, ``fetch_playergamelog``) cast the
-   value to :class:`str` so that integer inputs serialize correctly.
-6. **Return-value passthrough** — whatever ``NBAClient.get`` returns is
-   returned verbatim (object identity preserved), consistent with the
-   wrapper's thin-wrapper obligation under Rule 1.
-7. **Single call per invocation** — exactly one ``NBAClient.get`` call per
-   wrapper invocation (no retries, no internal pagination).
-
-Rule 1 Invariants
------------------
-These tests additionally verify the negative-space invariants enumerated in
-AAP §0.7.2.1 (Rule 1 — Single HTTP Client):
-
-- ``endpoints.players`` never imports ``requests``, ``urllib``, or ``httpx``.
-- ``endpoints.players`` never imports ``pandas`` (flat-CSV assertion enforced
-  downstream by :mod:`utils.schema_normalizer`).
-
-Mocking Strategy
+Rule 1 isolation
 ----------------
-Tests use the :class:`tests.conftest.RecordingClient` spy (a handwritten
-collaborator, *not* :class:`unittest.mock.MagicMock`) so that every
-``(endpoint, params)`` tuple is captured and asserted on. The spy is
-consistent with the conftest directive at §6.1 of the product spec: "tests
-rely on explicit fixtures with deterministic state transitions, not
-generic mocking libraries."
-
-Test Organization
------------------
-One ``TestCase``-style class per wrapper plus two module-level classes:
-
-- :class:`TestModuleInvariants` — cross-module assertions (Rule 1, logger
-  name, public callable surface).
-- :class:`TestParamDictShape` — parametric assertions that hold across every
-  wrapper (single call, season propagation). Note that
-  ``fetch_playercareerstats`` is excluded from the season parametric because
-  its endpoint does **not** accept a ``Season`` parameter.
+Every test exercises the wrapper with the :class:`RecordingClient` spy produced
+by the ``recording_client`` fixture factory in ``tests/conftest.py``. No real
+:class:`~api.nba_client.NBAClient` is constructed, no real ``requests`` call is
+issued, and no retry/rate-limit plumbing is exercised. The tests are therefore
+fully deterministic and network-isolated (Rule 1 — Single HTTP Client).
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict
+import pytest  # noqa: F401 — imported for parity with sibling test modules and
+# to enable future addition of pytest marks, pytest.raises, or pytest.parametrize
+# without requiring a separate import change.
 
-import pytest
-
-import config
 from endpoints import players
 
 
 # ---------------------------------------------------------------------------
-# fetch_leaguedashplayerstats — the flagship Players endpoint (36 keys)
+# fetch_leaguedashplayerstats
 # ---------------------------------------------------------------------------
 
 
-class TestFetchLeaguedashplayerstats:
-    """Covers :func:`endpoints.players.fetch_leaguedashplayerstats`."""
-
-    def test_delegates_to_client_get_with_correct_endpoint_name(
-        self, recording_client
-    ) -> None:
-        """The wrapper MUST invoke ``client.get`` exactly once with the NBA
-        Stats endpoint string ``"leaguedashplayerstats"`` (verbatim, no alias).
-        """
-        client = recording_client()
-
-        players.fetch_leaguedashplayerstats(client=client, season="2025-26")
-
-        assert len(client.calls) == 1
-        assert client.calls[0][0] == "leaguedashplayerstats"
-
-    def test_default_season_type_and_league_id_propagate_from_config(
-        self, recording_client
-    ) -> None:
-        """When the caller omits ``season_type`` and ``league_id``, the
-        wrapper MUST resolve them from :mod:`config`, preserving the authority
-        of the project-wide defaults documented in AAP §0.5.1.1.
-        """
-        client = recording_client()
-
-        players.fetch_leaguedashplayerstats(client=client, season="2025-26")
-
-        params: Dict[str, Any] = client.calls[0][1]
-        assert params["SeasonType"] == config.DEFAULT_SEASON_TYPE
-        assert params["LeagueID"] == config.DEFAULT_LEAGUE_ID
-
-    def test_required_param_surface_is_populated(self, recording_client) -> None:
-        """The 36-key param surface includes five caller-settable knobs
-        (``Season``, ``PerMode``, ``MeasureType``) plus a fixed triplet of
-        ``N``-flag filters (``PlusMinus``, ``PaceAdjust``, ``Rank``) and a
-        suite of zero-string numeric filters.
-        """
-        client = recording_client()
-
-        players.fetch_leaguedashplayerstats(
-            client=client,
-            season="2024-25",
-            per_mode="Totals",
-            measure_type="Advanced",
-        )
-
-        params = client.calls[0][1]
-        assert params["Season"] == "2024-25"
-        assert params["PerMode"] == "Totals"
-        assert params["MeasureType"] == "Advanced"
-        assert params["PlusMinus"] == "N"
-        assert params["PaceAdjust"] == "N"
-        assert params["Rank"] == "N"
-        assert params["LastNGames"] == "0"
-        assert params["Month"] == "0"
-        assert params["OpponentTeamID"] == "0"
-        assert params["Period"] == "0"
-        assert params["PORound"] == "0"
-        assert params["TeamID"] == "0"
-        assert params["TwoWay"] == "0"
-
-    def test_filter_strings_default_empty(self, recording_client) -> None:
-        """Every string-valued filter defaults to an empty string so that the
-        NBA Stats API interprets the field as "unset" rather than as a typed
-        value that would constrain the response.
-        """
-        client = recording_client()
-
-        players.fetch_leaguedashplayerstats(client=client, season="2025-26")
-
-        params = client.calls[0][1]
-        for key in (
-            "DateFrom",
-            "DateTo",
-            "GameSegment",
-            "Location",
-            "Outcome",
-            "SeasonSegment",
-            "ShotClockRange",
-            "VsConference",
-            "VsDivision",
-            "Conference",
-            "Division",
-            "College",
-            "Country",
-            "DraftPick",
-            "DraftYear",
-            "GameScope",
-            "Height",
-            "PlayerExperience",
-            "PlayerPosition",
-            "StarterBench",
-            "Weight",
-        ):
-            assert params[key] == "", f"{key!r} defaulted to {params[key]!r}"
-
-    def test_kwargs_override_defaults(self, recording_client) -> None:
-        """Caller-supplied ``**kwargs`` MUST win over the wrapper's literal
-        defaults, enabling targeted scenarios without mutating :mod:`config`.
-        """
-        client = recording_client()
-
-        players.fetch_leaguedashplayerstats(
-            client=client,
-            season="2025-26",
-            Conference="East",
-            LastNGames="10",
-            PlusMinus="Y",
-        )
-
-        params = client.calls[0][1]
-        assert params["Conference"] == "East"
-        assert params["LastNGames"] == "10"
-        assert params["PlusMinus"] == "Y"
-
-    def test_return_value_is_raw_client_response(self, recording_client) -> None:
-        """Thin-wrapper contract: the dict returned by ``NBAClient.get`` MUST
-        be returned by object identity, not copied, re-shaped, or filtered.
-        """
-        response: Dict[str, Any] = {
-            "resource": "leaguedashplayerstats",
-            "resultSets": [
-                {
-                    "name": "LeagueDashPlayerStats",
-                    "headers": ["PLAYER_ID", "PLAYER_NAME", "PTS"],
-                    "rowSet": [[2544, "LeBron James", 30.1]],
-                }
-            ],
-        }
-        client = recording_client(responses={"leaguedashplayerstats": response})
-
-        result = players.fetch_leaguedashplayerstats(client=client, season="2025-26")
-
-        assert result is response
-
-    def test_explicit_season_type_and_league_id_win(self, recording_client) -> None:
-        """When the caller explicitly supplies ``season_type`` or
-        ``league_id``, the explicit values MUST populate the param dict
-        (overriding the :mod:`config` defaults).
-        """
-        client = recording_client()
-
-        players.fetch_leaguedashplayerstats(
-            client=client,
-            season="2025-26",
-            season_type="Playoffs",
-            league_id="00",
-        )
-
-        params = client.calls[0][1]
-        assert params["SeasonType"] == "Playoffs"
-        assert params["LeagueID"] == "00"
-
-
-# ---------------------------------------------------------------------------
-# fetch_leaguedashplayerclutch — clutch-time variant (38 keys, OMITS TwoWay)
-# ---------------------------------------------------------------------------
-
-
-class TestFetchLeaguedashplayerclutch:
-    """Covers :func:`endpoints.players.fetch_leaguedashplayerclutch`."""
-
-    def test_delegates_to_client_get_with_correct_endpoint_name(
-        self, recording_client
-    ) -> None:
-        """The wrapper MUST invoke ``client.get`` exactly once with the NBA
-        Stats endpoint string ``"leaguedashplayerclutch"``.
-        """
-        client = recording_client()
-
-        players.fetch_leaguedashplayerclutch(client=client, season="2025-26")
-
-        assert len(client.calls) == 1
-        assert client.calls[0][0] == "leaguedashplayerclutch"
-
-    def test_default_season_type_and_league_id_propagate_from_config(
-        self, recording_client
-    ) -> None:
-        client = recording_client()
-
-        players.fetch_leaguedashplayerclutch(client=client, season="2025-26")
-
-        params = client.calls[0][1]
-        assert params["SeasonType"] == config.DEFAULT_SEASON_TYPE
-        assert params["LeagueID"] == config.DEFAULT_LEAGUE_ID
-
-    def test_clutch_specific_defaults(self, recording_client) -> None:
-        """The three clutch-specific defaults (``ClutchTime``,
-        ``AheadBehind``, ``PointDiff``) MUST appear in the param dict with
-        their documented default values.
-        """
-        client = recording_client()
-
-        players.fetch_leaguedashplayerclutch(client=client, season="2025-26")
-
-        params = client.calls[0][1]
-        assert params["ClutchTime"] == "Last 5 Minutes"
-        assert params["AheadBehind"] == "Ahead or Behind"
-        assert params["PointDiff"] == "5"
-
-    def test_point_diff_int_is_cast_to_string(self, recording_client) -> None:
-        """When the caller supplies ``point_diff`` as an :class:`int`, the
-        wrapper MUST coerce it to :class:`str` so the NBA Stats API receives a
-        JSON-serializable string value.
-        """
-        client = recording_client()
-
-        players.fetch_leaguedashplayerclutch(
-            client=client, season="2025-26", point_diff=10
-        )
-
-        params = client.calls[0][1]
-        assert params["PointDiff"] == "10"
-        assert isinstance(params["PointDiff"], str)
-
-    def test_twoway_key_is_omitted(self, recording_client) -> None:
-        """Unlike ``fetch_leaguedashplayerstats``, the clutch variant MUST
-        NOT include a ``TwoWay`` key in its param dict.
-
-        This distinguishes the Players-layer clutch variant from the Lineups
-        on/off variant (which DOES include ``TwoWay="0"``); see AAP §0.4.5.
-        """
-        client = recording_client()
-
-        players.fetch_leaguedashplayerclutch(client=client, season="2025-26")
-
-        params = client.calls[0][1]
-        assert "TwoWay" not in params
-
-    def test_thirty_eight_key_param_surface(self, recording_client) -> None:
-        """The clutch param dict defaults to exactly 38 keys — the
-        ``fetch_leaguedashplayerstats`` surface minus ``TwoWay`` plus
-        ``ClutchTime``, ``AheadBehind``, and ``PointDiff``.
-        """
-        client = recording_client()
-
-        players.fetch_leaguedashplayerclutch(client=client, season="2025-26")
-
-        params = client.calls[0][1]
-        assert len(params) == 38
-
-    def test_kwargs_override_defaults(self, recording_client) -> None:
-        client = recording_client()
-
-        players.fetch_leaguedashplayerclutch(
-            client=client,
-            season="2025-26",
-            ClutchTime="Last 3 Minutes",
-            AheadBehind="Ahead",
-        )
-
-        params = client.calls[0][1]
-        assert params["ClutchTime"] == "Last 3 Minutes"
-        assert params["AheadBehind"] == "Ahead"
-
-    def test_filter_strings_default_empty(self, recording_client) -> None:
-        client = recording_client()
-
-        players.fetch_leaguedashplayerclutch(client=client, season="2025-26")
-
-        params = client.calls[0][1]
-        for key in (
-            "DateFrom",
-            "DateTo",
-            "GameSegment",
-            "Location",
-            "Outcome",
-            "SeasonSegment",
-            "ShotClockRange",
-            "VsConference",
-            "VsDivision",
-            "Conference",
-            "Division",
-            "College",
-            "Country",
-            "DraftPick",
-            "DraftYear",
-            "GameScope",
-            "Height",
-            "PlayerExperience",
-            "PlayerPosition",
-            "StarterBench",
-            "Weight",
-        ):
-            assert params[key] == "", f"{key!r} defaulted to {params[key]!r}"
-
-    def test_return_value_is_raw_client_response(self, recording_client) -> None:
-        response: Dict[str, Any] = {
-            "resource": "leaguedashplayerclutch",
-            "resultSets": [
-                {
-                    "name": "LeagueDashPlayerClutch",
-                    "headers": ["PLAYER_ID", "PLAYER_NAME", "CLUTCH_PTS"],
-                    "rowSet": [[201939, "Stephen Curry", 8.3]],
-                }
-            ],
-        }
-        client = recording_client(responses={"leaguedashplayerclutch": response})
-
-        result = players.fetch_leaguedashplayerclutch(
-            client=client, season="2025-26"
-        )
-
-        assert result is response
-
-
-# ---------------------------------------------------------------------------
-# fetch_playercareerstats — strict 3-key, NO Season parameter
-# ---------------------------------------------------------------------------
-
-
-class TestFetchPlayercareerstats:
-    """Covers :func:`endpoints.players.fetch_playercareerstats`.
-
-    **Unique contract:** this is the only Players wrapper whose param dict
-    does NOT include a ``Season`` key. The NBA Stats API's
-    ``playercareerstats`` endpoint returns a player's entire career
-    aggregation, so scoping by season would defeat its purpose.
+def test_fetch_leaguedashplayerstats_calls_correct_endpoint(recording_client):
+    """``fetch_leaguedashplayerstats`` MUST delegate to ``client.get`` with the
+    upstream endpoint name ``"leaguedashplayerstats"``.
     """
+    client = recording_client()
 
-    def test_delegates_to_client_get_with_correct_endpoint_name(
-        self, recording_client
-    ) -> None:
-        client = recording_client()
+    players.fetch_leaguedashplayerstats(client, "2025-26", "Regular Season", "00")
 
-        players.fetch_playercareerstats(client=client, player_id="2544")
+    assert client.calls, "fetch_leaguedashplayerstats did not invoke client.get"
+    assert client.calls[-1][0] == "leaguedashplayerstats"
 
-        assert len(client.calls) == 1
-        assert client.calls[0][0] == "playercareerstats"
 
-    def test_player_id_string_is_passed_through_verbatim(
-        self, recording_client
-    ) -> None:
-        client = recording_client()
+def test_fetch_leaguedashplayerstats_required_params(recording_client):
+    """The canonical required-param surface for ``leaguedashplayerstats``.
 
-        players.fetch_playercareerstats(client=client, player_id="2544")
-
-        params = client.calls[0][1]
-        assert params["PlayerID"] == "2544"
-        assert isinstance(params["PlayerID"], str)
-
-    def test_player_id_int_is_cast_to_string(self, recording_client) -> None:
-        """Integer ``player_id`` MUST be coerced to :class:`str`."""
-        client = recording_client()
-
-        players.fetch_playercareerstats(client=client, player_id=2544)
-
-        params = client.calls[0][1]
-        assert params["PlayerID"] == "2544"
-        assert isinstance(params["PlayerID"], str)
-
-    def test_params_contains_only_three_keys(self, recording_client) -> None:
-        """Strict param-dict shape: exactly ``{PlayerID, PerMode, LeagueID}``.
-        No ``Season``, no ``SeasonType``, no filter scaffolding.
-        """
-        client = recording_client()
-
-        players.fetch_playercareerstats(client=client, player_id="2544")
-
-        params = client.calls[0][1]
-        assert set(params.keys()) == {"PlayerID", "PerMode", "LeagueID"}
-
-    def test_no_season_key_ever_appears(self, recording_client) -> None:
-        """Season must never leak into the param dict — not even as an
-        empty string — because ``playercareerstats`` is explicitly a
-        career-aggregate endpoint (AAP §0.5.1.4).
-        """
-        client = recording_client()
-
-        players.fetch_playercareerstats(client=client, player_id="2544")
-
-        params = client.calls[0][1]
-        assert "Season" not in params
-        assert "SeasonType" not in params
-
-    def test_default_per_mode_is_pergame(self, recording_client) -> None:
-        client = recording_client()
-
-        players.fetch_playercareerstats(client=client, player_id="2544")
-
-        params = client.calls[0][1]
-        assert params["PerMode"] == "PerGame"
-
-    def test_default_league_id_propagates_from_config(
-        self, recording_client
-    ) -> None:
-        client = recording_client()
-
-        players.fetch_playercareerstats(client=client, player_id="2544")
-
-        params = client.calls[0][1]
-        assert params["LeagueID"] == config.DEFAULT_LEAGUE_ID
-
-    def test_explicit_per_mode_and_league_id_win(self, recording_client) -> None:
-        client = recording_client()
-
-        players.fetch_playercareerstats(
-            client=client,
-            player_id="2544",
-            per_mode="Totals",
-            league_id="10",
-        )
-
-        params = client.calls[0][1]
-        assert params["PerMode"] == "Totals"
-        assert params["LeagueID"] == "10"
-
-    def test_return_value_is_raw_client_response(self, recording_client) -> None:
-        response: Dict[str, Any] = {
-            "resource": "playercareerstats",
-            "resultSets": [
-                {
-                    "name": "SeasonTotalsRegularSeason",
-                    "headers": ["PLAYER_ID", "SEASON_ID", "PTS"],
-                    "rowSet": [[2544, "2003-04", 1654]],
-                }
-            ],
-        }
-        client = recording_client(responses={"playercareerstats": response})
-
-        result = players.fetch_playercareerstats(client=client, player_id="2544")
-
-        assert result is response
-
-
-# ---------------------------------------------------------------------------
-# fetch_playergamelog — strict 6-key (PlayerID, Season, SeasonType, LeagueID,
-#                                     DateFrom, DateTo)
-# ---------------------------------------------------------------------------
-
-
-class TestFetchPlayergamelog:
-    """Covers :func:`endpoints.players.fetch_playergamelog`."""
-
-    def test_delegates_to_client_get_with_correct_endpoint_name(
-        self, recording_client
-    ) -> None:
-        client = recording_client()
-
-        players.fetch_playergamelog(
-            client=client, player_id="2544", season="2025-26"
-        )
-
-        assert len(client.calls) == 1
-        assert client.calls[0][0] == "playergamelog"
-
-    def test_player_id_string_is_passed_through_verbatim(
-        self, recording_client
-    ) -> None:
-        client = recording_client()
-
-        players.fetch_playergamelog(
-            client=client, player_id="2544", season="2025-26"
-        )
-
-        params = client.calls[0][1]
-        assert params["PlayerID"] == "2544"
-        assert isinstance(params["PlayerID"], str)
-
-    def test_player_id_int_is_cast_to_string(self, recording_client) -> None:
-        client = recording_client()
-
-        players.fetch_playergamelog(
-            client=client, player_id=2544, season="2025-26"
-        )
-
-        params = client.calls[0][1]
-        assert params["PlayerID"] == "2544"
-        assert isinstance(params["PlayerID"], str)
-
-    def test_default_season_type_and_league_id_propagate_from_config(
-        self, recording_client
-    ) -> None:
-        client = recording_client()
-
-        players.fetch_playergamelog(
-            client=client, player_id="2544", season="2025-26"
-        )
-
-        params = client.calls[0][1]
-        assert params["SeasonType"] == config.DEFAULT_SEASON_TYPE
-        assert params["LeagueID"] == config.DEFAULT_LEAGUE_ID
-
-    def test_date_from_and_date_to_default_to_empty_string(
-        self, recording_client
-    ) -> None:
-        client = recording_client()
-
-        players.fetch_playergamelog(
-            client=client, player_id="2544", season="2025-26"
-        )
-
-        params = client.calls[0][1]
-        assert params["DateFrom"] == ""
-        assert params["DateTo"] == ""
-
-    def test_explicit_date_bounds_are_passed_through(
-        self, recording_client
-    ) -> None:
-        client = recording_client()
-
-        players.fetch_playergamelog(
-            client=client,
-            player_id="2544",
-            season="2025-26",
-            date_from="10/22/2024",
-            date_to="04/13/2025",
-        )
-
-        params = client.calls[0][1]
-        assert params["DateFrom"] == "10/22/2024"
-        assert params["DateTo"] == "04/13/2025"
-
-    def test_params_contains_only_six_keys_by_default(
-        self, recording_client
-    ) -> None:
-        """Strict param-dict shape: exactly six keys. No hidden filters."""
-        client = recording_client()
-
-        players.fetch_playergamelog(
-            client=client, player_id="2544", season="2025-26"
-        )
-
-        params = client.calls[0][1]
-        assert set(params.keys()) == {
-            "PlayerID",
-            "Season",
-            "SeasonType",
-            "LeagueID",
-            "DateFrom",
-            "DateTo",
-        }
-
-    def test_kwargs_override_defaults(self, recording_client) -> None:
-        """Keyword-argument overrides (passed through ``**kwargs``) MUST
-        take precedence over literal defaults of equivalent name.
-        """
-        client = recording_client()
-
-        players.fetch_playergamelog(
-            client=client,
-            player_id="2544",
-            season="2025-26",
-            date_from="10/22/2024",
-            DateFrom="01/01/2025",
-        )
-
-        params = client.calls[0][1]
-        assert params["DateFrom"] == "01/01/2025"
-
-    def test_return_value_is_raw_client_response(self, recording_client) -> None:
-        response: Dict[str, Any] = {
-            "resource": "playergamelog",
-            "resultSets": [
-                {
-                    "name": "PlayerGameLog",
-                    "headers": ["GAME_ID", "PTS"],
-                    "rowSet": [["0022500001", 30]],
-                }
-            ],
-        }
-        client = recording_client(responses={"playergamelog": response})
-
-        result = players.fetch_playergamelog(
-            client=client, player_id="2544", season="2025-26"
-        )
-
-        assert result is response
-
-
-# ---------------------------------------------------------------------------
-# fetch_leaguedashptstats — player-tracking stats (29 keys, PtMeasureType +
-#                                                   PlayerOrTeam specific)
-# ---------------------------------------------------------------------------
-
-
-class TestFetchLeaguedashptstats:
-    """Covers :func:`endpoints.players.fetch_leaguedashptstats`."""
-
-    def test_delegates_to_client_get_with_correct_endpoint_name(
-        self, recording_client
-    ) -> None:
-        client = recording_client()
-
-        players.fetch_leaguedashptstats(client=client, season="2025-26")
-
-        assert len(client.calls) == 1
-        assert client.calls[0][0] == "leaguedashptstats"
-
-    def test_default_season_type_and_league_id_propagate_from_config(
-        self, recording_client
-    ) -> None:
-        client = recording_client()
-
-        players.fetch_leaguedashptstats(client=client, season="2025-26")
-
-        params = client.calls[0][1]
-        assert params["SeasonType"] == config.DEFAULT_SEASON_TYPE
-        assert params["LeagueID"] == config.DEFAULT_LEAGUE_ID
-
-    def test_default_pt_measure_type_is_speed_distance(
-        self, recording_client
-    ) -> None:
-        """The NBA Stats player-tracking surface requires a
-        ``PtMeasureType`` discriminator; the wrapper defaults to
-        ``"SpeedDistance"`` to provide a harmless, broad baseline.
-        """
-        client = recording_client()
-
-        players.fetch_leaguedashptstats(client=client, season="2025-26")
-
-        params = client.calls[0][1]
-        assert params["PtMeasureType"] == "SpeedDistance"
-
-    def test_default_player_or_team_is_player(self, recording_client) -> None:
-        """Because this wrapper lives in the Players domain module (F-009),
-        the default ``PlayerOrTeam`` discriminator is ``"Player"``. The
-        Teams-domain consumer can opt into ``"Team"`` via the explicit
-        keyword argument.
-        """
-        client = recording_client()
-
-        players.fetch_leaguedashptstats(client=client, season="2025-26")
-
-        params = client.calls[0][1]
-        assert params["PlayerOrTeam"] == "Player"
-
-    def test_default_per_mode_is_pergame(self, recording_client) -> None:
-        client = recording_client()
-
-        players.fetch_leaguedashptstats(client=client, season="2025-26")
-
-        params = client.calls[0][1]
-        assert params["PerMode"] == "PerGame"
-
-    def test_omits_measure_surface_keys(self, recording_client) -> None:
-        """The player-tracking endpoint does NOT accept the standard
-        advanced-box-score knobs. The wrapper MUST omit them from the param
-        dict so the upstream API does not reject the request.
-        """
-        client = recording_client()
-
-        players.fetch_leaguedashptstats(client=client, season="2025-26")
-
-        params = client.calls[0][1]
-        for forbidden in (
-            "MeasureType",
-            "PlusMinus",
-            "PaceAdjust",
-            "Rank",
-            "Period",
-            "PORound",
-            "GameSegment",
-            "ShotClockRange",
-            "TwoWay",
-        ):
-            assert (
-                forbidden not in params
-            ), f"Forbidden key {forbidden!r} leaked into param dict"
-
-    def test_numeric_default_filters_are_zero_strings(
-        self, recording_client
-    ) -> None:
-        client = recording_client()
-
-        players.fetch_leaguedashptstats(client=client, season="2025-26")
-
-        params = client.calls[0][1]
-        for key in ("LastNGames", "Month", "OpponentTeamID", "TeamID"):
-            assert params[key] == "0", f"{key!r} defaulted to {params[key]!r}"
-
-    def test_string_filters_default_empty(self, recording_client) -> None:
-        client = recording_client()
-
-        players.fetch_leaguedashptstats(client=client, season="2025-26")
-
-        params = client.calls[0][1]
-        for key in (
-            "DateFrom",
-            "DateTo",
-            "GameScope",
-            "Location",
-            "Outcome",
-            "SeasonSegment",
-            "VsConference",
-            "VsDivision",
-            "College",
-            "Conference",
-            "Country",
-            "DraftPick",
-            "DraftYear",
-            "Division",
-            "Height",
-            "PlayerExperience",
-            "PlayerPosition",
-            "StarterBench",
-            "Weight",
-        ):
-            assert params[key] == "", f"{key!r} defaulted to {params[key]!r}"
-
-    def test_explicit_pt_measure_type_wins(self, recording_client) -> None:
-        """The caller may specialize the player-tracking surface via
-        ``pt_measure_type``; the explicit value MUST replace the default.
-        """
-        client = recording_client()
-
-        players.fetch_leaguedashptstats(
-            client=client, season="2025-26", pt_measure_type="Drives"
-        )
-
-        params = client.calls[0][1]
-        assert params["PtMeasureType"] == "Drives"
-
-    def test_explicit_player_or_team_wins(self, recording_client) -> None:
-        client = recording_client()
-
-        players.fetch_leaguedashptstats(
-            client=client, season="2025-26", player_or_team="Team"
-        )
-
-        params = client.calls[0][1]
-        assert params["PlayerOrTeam"] == "Team"
-
-    def test_kwargs_override_defaults(self, recording_client) -> None:
-        client = recording_client()
-
-        players.fetch_leaguedashptstats(
-            client=client,
-            season="2025-26",
-            Location="Home",
-            Month="10",
-        )
-
-        params = client.calls[0][1]
-        assert params["Location"] == "Home"
-        assert params["Month"] == "10"
-
-    def test_twenty_nine_key_param_surface(self, recording_client) -> None:
-        """The player-tracking param dict resolves to exactly 29 keys."""
-        client = recording_client()
-
-        players.fetch_leaguedashptstats(client=client, season="2025-26")
-
-        params = client.calls[0][1]
-        assert len(params) == 29
-
-    def test_return_value_is_raw_client_response(self, recording_client) -> None:
-        response: Dict[str, Any] = {
-            "resource": "leaguedashptstats",
-            "resultSets": [
-                {
-                    "name": "LeagueDashPtStats",
-                    "headers": ["PLAYER_ID", "DIST_MILES"],
-                    "rowSet": [[2544, 2.45]],
-                }
-            ],
-        }
-        client = recording_client(responses={"leaguedashptstats": response})
-
-        result = players.fetch_leaguedashptstats(client=client, season="2025-26")
-
-        assert result is response
-
-
-# ---------------------------------------------------------------------------
-# Cross-module invariants (Rule 1, logger, public surface)
-# ---------------------------------------------------------------------------
-
-
-class TestModuleInvariants:
-    """Negative-space and structural invariants on :mod:`endpoints.players`."""
-
-    def test_module_does_not_import_requests(self) -> None:
-        """Rule 1 — Single HTTP Client. The endpoint wrapper module MUST
-        NOT import the ``requests`` (or equivalent) HTTP library at module
-        level; it must delegate all transport to :class:`NBAClient`.
-        """
-        assert not hasattr(players, "requests")
-        assert not hasattr(players, "urllib")
-        assert not hasattr(players, "httpx")
-
-    def test_module_does_not_import_pandas(self) -> None:
-        """Rule 1 side-effect: the wrapper layer is data-shape-agnostic.
-        The transformation to DataFrames happens downstream in
-        :mod:`utils.schema_normalizer` (Rule 4).
-        """
-        assert not hasattr(players, "pd")
-        assert not hasattr(players, "pandas")
-
-    def test_five_public_callables_exported(self) -> None:
-        """F-009 requires exactly five public wrappers (AAP §0.5.1.4)."""
-        for name in (
-            "fetch_leaguedashplayerstats",
-            "fetch_leaguedashplayerclutch",
-            "fetch_playercareerstats",
-            "fetch_playergamelog",
-            "fetch_leaguedashptstats",
-        ):
-            attr = getattr(players, name, None)
-            assert callable(attr), f"{name!r} is not a callable on endpoints.players"
-
-    def test_module_uses_module_level_logger(self) -> None:
-        """Observability rule: every module emits structured logs through a
-        module-level logger (not ``print``, not per-function loggers).
-        """
-        assert hasattr(players, "logger")
-
-    def test_logger_name_matches_module_path(self) -> None:
-        """The module's logger name MUST match its dotted import path, so
-        hierarchical logger filtering works at the package level.
-        """
-        adapter = players.logger
-        underlying = getattr(adapter, "logger", adapter)
-        assert underlying.name == "endpoints.players"
-
-
-# ---------------------------------------------------------------------------
-# Parametric cross-wrapper assertions
-# ---------------------------------------------------------------------------
-
-
-class TestParamDictShape:
-    """Assertions that hold across every wrapper in :mod:`endpoints.players`.
-
-    Note that :func:`fetch_playercareerstats` is intentionally excluded from
-    the season-verbatim parametric because that endpoint does NOT accept a
-    ``Season`` parameter (see :class:`TestFetchPlayercareerstats`).
+    Asserts on KEY params only (Season, SeasonType, LeagueID, PerMode,
+    MeasureType) — does NOT assert on the full ~35-field filter scaffold to
+    keep the test decoupled from the wrapper's internal default list.
     """
+    client = recording_client()
 
-    @pytest.mark.parametrize(
-        ("func", "extra_kwargs", "expected_endpoint"),
-        [
-            (
-                players.fetch_leaguedashplayerstats,
-                {},
-                "leaguedashplayerstats",
-            ),
-            (
-                players.fetch_leaguedashplayerclutch,
-                {},
-                "leaguedashplayerclutch",
-            ),
-            (
-                players.fetch_playercareerstats,
-                {"player_id": "2544"},
-                "playercareerstats",
-            ),
-            (
-                players.fetch_playergamelog,
-                {"player_id": "2544"},
-                "playergamelog",
-            ),
-            (
-                players.fetch_leaguedashptstats,
-                {},
-                "leaguedashptstats",
-            ),
-        ],
+    players.fetch_leaguedashplayerstats(client, "2025-26", "Regular Season", "00")
+
+    params = client.calls[-1][1]
+    assert params["Season"] == "2025-26"
+    assert params["SeasonType"] == "Regular Season"
+    assert params["LeagueID"] == "00"
+    assert params["PerMode"] == "PerGame"
+    assert params["MeasureType"] == "Base"
+
+
+def test_fetch_leaguedashplayerstats_kwargs_override_defaults(recording_client):
+    """Title-case kwargs (e.g. ``MeasureType="Advanced"``) MUST override the
+    wrapper-owned defaults via ``params.update(kwargs)`` precedence.
+    """
+    client = recording_client()
+
+    players.fetch_leaguedashplayerstats(
+        client, "2025-26", "Regular Season", "00", MeasureType="Advanced"
     )
-    def test_every_wrapper_issues_exactly_one_call(
-        self,
-        recording_client,
-        func,
-        extra_kwargs,
-        expected_endpoint,
-    ) -> None:
-        client = recording_client()
 
-        # ``fetch_playercareerstats`` does not accept ``season``; for all
-        # other wrappers, pass a fixed season to satisfy the required
-        # positional/keyword contract.
-        if func is players.fetch_playercareerstats:
-            func(client=client, **extra_kwargs)
-        else:
-            func(client=client, season="2025-26", **extra_kwargs)
+    assert client.calls[-1][1]["MeasureType"] == "Advanced"
 
-        assert len(client.calls) == 1
-        assert client.calls[0][0] == expected_endpoint
 
-    @pytest.mark.parametrize(
-        ("func", "extra_kwargs"),
-        [
-            (players.fetch_leaguedashplayerstats, {}),
-            (players.fetch_leaguedashplayerclutch, {}),
-            # fetch_playercareerstats is EXCLUDED — no Season parameter.
-            (players.fetch_playergamelog, {"player_id": "2544"}),
-            (players.fetch_leaguedashptstats, {}),
-        ],
+def test_fetch_leaguedashplayerstats_returns_raw_dict(
+    recording_client, sample_single_table_payload
+):
+    """The wrapper MUST return the raw dict from ``client.get`` UNMODIFIED.
+
+    Injects a canonical single-table payload via ``responses=``, invokes the
+    wrapper, and asserts the returned value equals the injected payload. This
+    is the pass-through / identity contract — no transformation, filtering, or
+    flattening occurs inside the wrapper.
+    """
+    client = recording_client(
+        responses={"leaguedashplayerstats": sample_single_table_payload}
     )
-    def test_every_wrapper_populates_season_verbatim(
-        self,
-        recording_client,
-        func,
-        extra_kwargs,
-    ) -> None:
-        """Every Season-accepting wrapper MUST propagate the caller's
-        ``season`` argument verbatim into the ``Season`` key of the param
-        dict. No transformation, no default substitution.
-        """
-        client = recording_client()
 
-        func(client=client, season="2024-25", **extra_kwargs)
+    result = players.fetch_leaguedashplayerstats(
+        client, "2025-26", "Regular Season", "00"
+    )
 
-        params = client.calls[0][1]
-        assert params["Season"] == "2024-25"
+    assert result == sample_single_table_payload
+
+
+# ---------------------------------------------------------------------------
+# fetch_leaguedashplayerclutch
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_leaguedashplayerclutch_calls_correct_endpoint(recording_client):
+    """``fetch_leaguedashplayerclutch`` MUST delegate to ``client.get`` with
+    the upstream endpoint name ``"leaguedashplayerclutch"``.
+    """
+    client = recording_client()
+
+    players.fetch_leaguedashplayerclutch(client, "2025-26", "Regular Season", "00")
+
+    assert client.calls, "fetch_leaguedashplayerclutch did not invoke client.get"
+    assert client.calls[-1][0] == "leaguedashplayerclutch"
+
+
+def test_fetch_leaguedashplayerclutch_includes_clutch_params(recording_client):
+    """The clutch variant MUST emit the three clutch-specific params —
+    ``ClutchTime``, ``AheadBehind``, and ``PointDiff`` — as presence-verifiable
+    keys in the request params dict.
+    """
+    client = recording_client()
+
+    players.fetch_leaguedashplayerclutch(client, "2025-26", "Regular Season", "00")
+
+    params = client.calls[-1][1]
+    assert "ClutchTime" in params
+    assert params["ClutchTime"], "ClutchTime must be non-empty"
+    assert "AheadBehind" in params
+    assert "PointDiff" in params
+
+
+def test_fetch_leaguedashplayerclutch_default_point_diff(recording_client):
+    """Default ``PointDiff`` resolves to ``"5"`` when the caller does not
+    override it.
+
+    ``str(params["PointDiff"]) == "5"`` accepts either int or str encoding so
+    the test is not coupled to the wrapper's internal cast choice. The
+    production code casts to :class:`str` via ``point_diff=str(point_diff)``,
+    but this assertion also passes if a future refactor stores the value as an
+    :class:`int` before the upstream serialization step.
+    """
+    client = recording_client()
+
+    players.fetch_leaguedashplayerclutch(client, "2025-26", "Regular Season", "00")
+
+    assert str(client.calls[-1][1]["PointDiff"]) == "5"
+
+
+def test_fetch_leaguedashplayerclutch_kwargs_passthrough(recording_client):
+    """Title-case kwargs MUST override the wrapper-owned clutch defaults.
+
+    Passes ``ClutchTime="Last 3 Minutes"`` as a kwarg (matching the NBA Stats
+    API's title-case param convention) and asserts the value propagates
+    verbatim into the request params, overriding the wrapper default
+    ``"Last 5 Minutes"``.
+    """
+    client = recording_client()
+
+    players.fetch_leaguedashplayerclutch(
+        client, "2025-26", "Regular Season", "00", ClutchTime="Last 3 Minutes"
+    )
+
+    assert client.calls[-1][1]["ClutchTime"] == "Last 3 Minutes"
+
+
+# ---------------------------------------------------------------------------
+# fetch_playercareerstats — the SIGNATURE EXCEPTION (no ``season`` parameter)
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_playercareerstats_calls_correct_endpoint(recording_client):
+    """``fetch_playercareerstats`` MUST delegate to ``client.get`` with the
+    upstream endpoint name ``"playercareerstats"``.
+    """
+    client = recording_client()
+
+    players.fetch_playercareerstats(client, "2544")
+
+    assert client.calls, "fetch_playercareerstats did not invoke client.get"
+    assert client.calls[-1][0] == "playercareerstats"
+
+
+def test_fetch_playercareerstats_includes_player_id_as_string(recording_client):
+    """Integer ``player_id`` inputs MUST be coerced to :class:`str`.
+
+    The NBA Stats API requires ``PlayerID`` as a JSON-serializable string
+    ("2544"), so the wrapper calls ``str(player_id)`` defensively. Passing
+    the integer ``2544`` (not the string ``"2544"``) and asserting the
+    resulting ``params["PlayerID"] == "2544"`` verifies the cast.
+    """
+    client = recording_client()
+
+    players.fetch_playercareerstats(client, 2544)  # int input — must be str-cast
+
+    assert client.calls[-1][1]["PlayerID"] == "2544"
+
+
+def test_fetch_playercareerstats_no_season_param(recording_client):
+    """``playercareerstats`` returns the ENTIRE career — no ``Season`` param.
+
+    The NBA Stats ``playercareerstats`` endpoint returns an aggregated career
+    history, so scoping by season would defeat its purpose. This test is the
+    dedicated regression guard against a future refactor that mistakenly adds
+    a ``Season`` key to the params dict.
+    """
+    client = recording_client()
+
+    players.fetch_playercareerstats(client, "2544")
+
+    assert "Season" not in client.calls[-1][1]
+
+
+def test_fetch_playercareerstats_kwargs_passthrough(recording_client):
+    """Title-case kwargs MUST override the wrapper-owned ``PerMode`` default.
+
+    Passing ``PerMode="Totals"`` overrides the wrapper default ``"PerGame"``
+    via ``params.update(kwargs)`` precedence.
+    """
+    client = recording_client()
+
+    players.fetch_playercareerstats(client, "2544", PerMode="Totals")
+
+    assert client.calls[-1][1]["PerMode"] == "Totals"
+
+
+# ---------------------------------------------------------------------------
+# fetch_playergamelog
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_playergamelog_calls_correct_endpoint(recording_client):
+    """``fetch_playergamelog`` MUST delegate to ``client.get`` with the
+    upstream endpoint name ``"playergamelog"``.
+    """
+    client = recording_client()
+
+    players.fetch_playergamelog(client, "2544", "2025-26", "Regular Season", "00")
+
+    assert client.calls, "fetch_playergamelog did not invoke client.get"
+    assert client.calls[-1][0] == "playergamelog"
+
+
+def test_fetch_playergamelog_includes_player_id_and_season(recording_client):
+    """``fetch_playergamelog`` MUST emit ``PlayerID`` (as :class:`str`),
+    ``Season``, ``SeasonType``, and ``LeagueID`` in the request params.
+
+    Passes the integer ``2544`` as ``player_id`` to verify the
+    ``str(player_id)`` defensive cast, and asserts the remaining three
+    required params propagate from the positional call arguments.
+    """
+    client = recording_client()
+
+    players.fetch_playergamelog(client, 2544, "2025-26", "Regular Season", "00")
+
+    params = client.calls[-1][1]
+    assert params["PlayerID"] == "2544"  # integer cast to string
+    assert params["Season"] == "2025-26"
+    assert params["SeasonType"] == "Regular Season"
+    assert params["LeagueID"] == "00"
+
+
+def test_fetch_playergamelog_kwargs_passthrough(recording_client):
+    """Title-case kwargs MUST override the wrapper-owned date-filter defaults.
+
+    Passes ``DateFrom="10/01/2025"`` as a kwarg; the wrapper default is the
+    empty string ``""``. ``params.update(kwargs)`` merges the kwarg with
+    override precedence so the resulting ``params["DateFrom"]`` is the caller-
+    supplied value.
+    """
+    client = recording_client()
+
+    players.fetch_playergamelog(
+        client, "2544", "2025-26", "Regular Season", "00", DateFrom="10/01/2025"
+    )
+
+    assert client.calls[-1][1]["DateFrom"] == "10/01/2025"
+
+
+# ---------------------------------------------------------------------------
+# fetch_leaguedashptstats — player-tracking stats
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_leaguedashptstats_calls_correct_endpoint(recording_client):
+    """``fetch_leaguedashptstats`` MUST delegate to ``client.get`` with the
+    upstream endpoint name ``"leaguedashptstats"``.
+    """
+    client = recording_client()
+
+    players.fetch_leaguedashptstats(client, "2025-26", "Regular Season", "00")
+
+    assert client.calls, "fetch_leaguedashptstats did not invoke client.get"
+    assert client.calls[-1][0] == "leaguedashptstats"
+
+
+def test_fetch_leaguedashptstats_includes_tracking_params(recording_client):
+    """The player-tracking variant MUST emit a ``PtMeasureType`` discriminator
+    plus ``PlayerOrTeam`` and ``Season`` in the request params.
+
+    The NBA Stats ``leaguedashptstats`` endpoint requires a ``PtMeasureType``
+    discriminator ("SpeedDistance", "Drives", "Passing", etc.) to select the
+    tracking measurement category. Asserts on presence and non-emptiness for
+    ``PtMeasureType``, presence for ``PlayerOrTeam``, and verbatim value for
+    ``Season``.
+    """
+    client = recording_client()
+
+    players.fetch_leaguedashptstats(client, "2025-26", "Regular Season", "00")
+
+    params = client.calls[-1][1]
+    assert "PtMeasureType" in params
+    assert params["PtMeasureType"], "PtMeasureType must be non-empty"
+    assert "PlayerOrTeam" in params
+    assert params["Season"] == "2025-26"
+
+
+def test_fetch_leaguedashptstats_default_player_or_team(recording_client):
+    """Because this wrapper lives in the Players domain module (F-009), the
+    default ``PlayerOrTeam`` discriminator MUST be ``"Player"``.
+
+    The Teams-domain consumer can opt into ``"Team"`` via the explicit
+    ``player_or_team="Team"`` keyword argument, but the default (as established
+    by the wrapper's default param value) resolves to ``"Player"``.
+    """
+    client = recording_client()
+
+    players.fetch_leaguedashptstats(client, "2025-26", "Regular Season", "00")
+
+    assert client.calls[-1][1]["PlayerOrTeam"] == "Player"
+
+
+def test_fetch_leaguedashptstats_kwargs_override(recording_client):
+    """Title-case kwargs MUST override the wrapper-owned ``PtMeasureType``
+    default.
+
+    Passing ``PtMeasureType="Drives"`` overrides the wrapper default
+    ``"SpeedDistance"`` via ``params.update(kwargs)`` precedence.
+    """
+    client = recording_client()
+
+    players.fetch_leaguedashptstats(
+        client, "2025-26", "Regular Season", "00", PtMeasureType="Drives"
+    )
+
+    assert client.calls[-1][1]["PtMeasureType"] == "Drives"
+
+
+def test_fetch_leaguedashptstats_returns_raw_payload(
+    recording_client, sample_single_table_payload
+):
+    """The wrapper MUST return the raw dict from ``client.get`` UNMODIFIED.
+
+    Injects a canonical single-table payload via ``responses=``, invokes the
+    wrapper, and asserts the returned value equals the injected payload. This
+    is the pass-through / identity contract — no transformation, filtering, or
+    flattening occurs inside the wrapper.
+    """
+    client = recording_client(
+        responses={"leaguedashptstats": sample_single_table_payload}
+    )
+
+    result = players.fetch_leaguedashptstats(
+        client, "2025-26", "Regular Season", "00"
+    )
+
+    assert result == sample_single_table_payload
