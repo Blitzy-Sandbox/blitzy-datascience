@@ -85,26 +85,26 @@ re-export block below, and the ``__all__`` tuple.
 
 # F-009 Players — 5 wrappers
 from endpoints.players import (
-    fetch_leaguedashplayerstats,
     fetch_leaguedashplayerclutch,
+    fetch_leaguedashplayerstats,
+    fetch_leaguedashptstats,
     fetch_playercareerstats,
     fetch_playergamelog,
-    fetch_leaguedashptstats,
 )
 
 # F-010 Teams — 3 wrappers
 from endpoints.teams import (
     fetch_leaguedashteamstats,
-    fetch_teamgamelog,
     fetch_teamdashboardbygeneralsplits,
+    fetch_teamgamelog,
 )
 
 # F-011 Games — 4 wrappers
 from endpoints.games import (
-    fetch_scoreboardv2,
-    fetch_boxscoretraditionalv2,
     fetch_boxscoreadvancedv2,
+    fetch_boxscoretraditionalv2,
     fetch_playbyplayv2,
+    fetch_scoreboardv2,
 )
 
 # F-012 Lineups — 2 wrappers (fetch_leaguedashplayerclutch_onoff shares
@@ -119,38 +119,35 @@ from endpoints.lineups import (
 # F-013 Schedule — 1 wrapper + 1 helper (the helper is the integration
 # seam consumed by the Games pipeline for GAME_ID enumeration).
 from endpoints.schedule import (
-    fetch_leaguegamefinder,
     enumerate_game_ids,
+    fetch_leaguegamefinder,
 )
 
 # ---------------------------------------------------------------------------
 # __all__ manifest — canonical 16-name public API surface of the package.
 #
-# Ordered to match the docstring feature mapping; the length MUST remain
-# equal to 16 and every name MUST resolve to a callable defined in one of
-# the five submodules above. A contract test in
-# ``tests/unit/endpoints/`` pins both invariants.
+# Ordered strictly alphabetically (AAP §0.5.1.4 Phase 5 Style Constraint)
+# for easy diff/review; the length MUST remain equal to 16 and every name
+# MUST resolve to a callable defined in one of the five submodules above.
+# A contract test in ``tests/unit/endpoints/`` pins both invariants. The
+# container is a tuple (immutable by construction) so downstream tooling
+# cannot mutate the public API surface at runtime.
 # ---------------------------------------------------------------------------
-__all__ = [
-    # Players (F-009)
-    "fetch_leaguedashplayerstats",
+__all__ = (
+    "enumerate_game_ids",
+    "fetch_boxscoreadvancedv2",
+    "fetch_boxscoretraditionalv2",
+    "fetch_leaguedashlineups",
     "fetch_leaguedashplayerclutch",
+    "fetch_leaguedashplayerclutch_onoff",
+    "fetch_leaguedashplayerstats",
+    "fetch_leaguedashptstats",
+    "fetch_leaguedashteamstats",
+    "fetch_leaguegamefinder",
+    "fetch_playbyplayv2",
     "fetch_playercareerstats",
     "fetch_playergamelog",
-    "fetch_leaguedashptstats",
-    # Teams (F-010)
-    "fetch_leaguedashteamstats",
-    "fetch_teamgamelog",
-    "fetch_teamdashboardbygeneralsplits",
-    # Games (F-011)
     "fetch_scoreboardv2",
-    "fetch_boxscoretraditionalv2",
-    "fetch_boxscoreadvancedv2",
-    "fetch_playbyplayv2",
-    # Lineups (F-012)
-    "fetch_leaguedashlineups",
-    "fetch_leaguedashplayerclutch_onoff",
-    # Schedule (F-013)
-    "fetch_leaguegamefinder",
-    "enumerate_game_ids",
-]
+    "fetch_teamdashboardbygeneralsplits",
+    "fetch_teamgamelog",
+)
