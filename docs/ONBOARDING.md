@@ -359,6 +359,35 @@ All CSVs are UTF-8 encoded and written with `index=False` so there is no leading
 
 **Fix:** run `curl -I https://stats.nba.com/stats/leaguegamefinder` to verify raw connectivity. If that hangs, fix DNS / proxy first. On macOS a common fix is `scutil --dns` and then a network reset; on Linux, check `/etc/resolv.conf`.
 
+### Pitfall 9: NBA Stats API returns HTTP 403 or silently times out on `/stats/*` (Akamai geo/bot block)
+
+**Symptom:** `python run.py ready` reports `"status": "not_ready"`; logs show one of:
+
+* `ERROR NBAClient request failed endpoint=... status=403` (immediate rejection), OR
+* `WARNING NBAClient retrying endpoint=... attempt=N exc_class=ReadTimeout` followed by `ERROR NBAClient request exhausted retries ... reason=timeout` (silent drop at the read phase).
+
+Reachability diagnostics show general internet access works but `stats.nba.com/stats/*` specifically is unreachable:
+
+```bash
+curl -sI https://www.nba.com/                        # returns 200 OK
+curl -sI https://stats.nba.com/                       # returns 301 to www.nba.com
+curl -sI -H "Referer: https://stats.nba.com" \
+     -H "User-Agent: Mozilla/5.0" \
+     "https://stats.nba.com/stats/leaguegamefinder?LeagueID=00&Season=2025-26"
+# hangs > 30s or returns 403 with x-akamai-* response headers
+```
+
+**Cause:** the NBA Stats API is fronted by **Akamai**, which enforces bot- and geo-based access controls on the `/stats/*` paths. Requests originating from **non-US geographies**, **cloud-provider IP ranges** (AWS, GCP, Azure, DigitalOcean, Hetzner, Linode, etc.), **datacenter ASNs**, or common **VPN exit nodes** are either dropped silently (`ReadTimeout`) or rejected with `HTTP 403` plus `x-akamai-*` headers. The Rule 3 `Referer: https://stats.nba.com` and browser-like `User-Agent` headers are correct — Akamai is keying on network-layer attributes that no amount of header tuning can disguise from a datacenter IP.
+
+**Fix:**
+
+1. **Confirm the block is network-level, not code-level** by running `curl -v -H "User-Agent: Mozilla/5.0" -H "Referer: https://stats.nba.com" "https://stats.nba.com/stats/leaguegamefinder?LeagueID=00&Season=2025-26" 2>&1 | grep -iE '^< HTTP|x-akamai|server:'`. Presence of `x-akamai-*` response headers or an `HTTP/.* 403` status confirms the block.
+2. **Run from a US residential IP.** This is the most reliable path. A personal laptop on residential broadband or a US-based residential/mobile VPN typically works unchanged.
+3. **On a cloud VM, proxy through a residential/mobile exit.** Options include: (a) an SSH tunnel to a US residential machine (`ssh -D 1080 user@home-box`, then `export HTTPS_PROXY=socks5://127.0.0.1:1080`); (b) a paid residential-proxy provider; (c) a managed residential VPN (the NBA Stats API is a notoriously hard target for datacenter egress, so consumer VPNs on shared datacenter IPs usually do not work).
+4. **Verify after the fix** with `python run.py ready` — it should now report `"status": "ready"` — then re-run your pipeline. The checkpoint will resume where it stopped, so no data is lost during the network-layer troubleshooting.
+
+> This is an **environmental** constraint, not a code defect. The pipeline's retry, rate-limit, and error-handling logic operate correctly under the block; they simply cannot produce data when the upstream is unreachable.
+
 ---
 
 ## How to Extend the Project

@@ -98,6 +98,10 @@ See [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md) for the full log format, the 
 
 Exposed counters: `nba_requests_total`, `nba_request_failures_total`, `nba_retries_total`, `pipeline_rows_written_total`, `pipeline_runs_total`, `games_failed_total`.
 
+## Troubleshooting
+
+The NBA Stats API at `stats.nba.com/stats/*` is fronted by **Akamai**, which enforces bot- and geo-based access controls. Requests from **non-US geographies**, **cloud-provider IP ranges** (AWS, GCP, Azure, etc.), **datacenter ASNs**, or common **VPN exit nodes** are typically dropped silently (`ReadTimeout`) or rejected with `HTTP 403`. If `python run.py ready` reports `"status": "not_ready"` or the pipeline logs `ReadTimeout` / `403` errors, the upstream is unreachable from your current network — this is **environmental, not a code defect**. Run from a US residential IP or tunnel through a residential exit. See [docs/ONBOARDING.md#pitfall-9-nba-stats-api-returns-http-403-or-silently-times-out-on-stats-akamai-geobot-block](docs/ONBOARDING.md) Pitfall 9 for full diagnostics and fixes.
+
 ## Documentation
 
 | Document | Purpose |

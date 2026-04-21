@@ -120,6 +120,7 @@ from __future__ import annotations
 from typing import Any, Callable, Dict, Iterable, List, Optional
 from unittest.mock import MagicMock
 
+import pandas as pd
 import pytest  # noqa: F401  (imported to satisfy Phase 1 header convention)
 
 import config
@@ -561,7 +562,465 @@ def test_run_idempotent_skip_when_all_games_checkpointed(
 
 
 # ---------------------------------------------------------------------------
-# Test 3 — Rule 5 ordering (mark_completed follows writes per game)
+# Test 3 — Resume preserves existing CSV rows (QA FC-1 Issue 2)
+# ---------------------------------------------------------------------------
+
+
+def test_run_resume_preserves_existing_csv_rows(
+    monkeypatch: pytest.MonkeyPatch,
+    recording_client,
+    recording_writer,
+    recording_checkpoint,
+    sample_multi_table_payload: Dict[str, Any],
+    sample_playbyplay_payload: Dict[str, Any],
+    tmp_path,
+) -> None:
+    """Cumulative-CSV resume contract (QA Final Checkpoint FC-1, Issue 2).
+
+    Regression guard for the resume-determinism defect identified by the QA
+    agent at Final Checkpoint FC-1: prior to the Issue 2 fix, the Games
+    pipeline's on-disk ``games.csv`` and ``play_by_play.csv`` were
+    **session-scoped** — after an interrupt-and-resume cycle the disk
+    artifacts contained only the *current* session's rows, not the cumulative
+    union of all sessions. The fix in ``pipelines/ingest_games.py`` adds two
+    helpers (``_load_existing_games`` / ``_load_existing_pbp``) that seed the
+    in-memory append buffers from any pre-existing CSVs before the per-game
+    iteration begins, while de-duplicating any rows whose ``GAME_ID`` is
+    scheduled for refresh in the current run. See the module docstring's
+    "Resume semantics" section for the full contract.
+
+    This test exercises that contract end-to-end under fully mocked
+    collaborators:
+
+    1. **History preservation.** Rows in ``games.csv`` / ``play_by_play.csv``
+       whose ``GAME_ID`` is NOT in the current run's pending set must survive
+       verbatim into every cumulative write performed by the current run.
+
+    2. **Refresh-aware dedupe.** Rows in the seed CSV whose ``GAME_ID`` IS in
+       the current run's pending set must be discarded by the seed loader —
+       the current run's fresh fetch is the authoritative data for those
+       games. This prevents the doubling-up that would otherwise occur when
+       the pipeline re-fetches an already-completed but uncheckpointed game.
+
+    3. **Monotonic cumulative growth.** Each subsequent per-game write must
+       contain ≥ the row count of the previous per-game write of the same
+       artifact name. Concretely: with 2 preserved seed rows and a mock
+       payload of 2 PlayerStats rows per game across 3 games, the three
+       successive ``games.csv`` writes must have row counts ``[4, 6, 8]``.
+       Equivalently for ``play_by_play.csv``: with 2 preserved seed rows
+       and 3 PlayByPlay rows per game, counts are ``[5, 8, 11]``.
+
+    4. **Rule 5 checkpoint determinism.** The resume contract must not alter
+       the per-game checkpoint ordering: one ``mark_completed`` call per
+       successfully processed (not skipped) GAME_ID, in iteration order.
+
+    The test intentionally does NOT patch the checkpoint manager to report
+    prior-session completion for any of the 3 pending game IDs: the goal is
+    to cover the realistic crash-recovery edge case where the on-disk CSV
+    reflects *more* games than the on-disk checkpoint does (e.g., the
+    process died between CSV write and checkpoint mark). In that regime,
+    pending-ID-aware seed dedupe is what guarantees the fresh fetch wins.
+
+    Seed rows for the test are shaped to mirror the runtime column schema
+    produced by :func:`pipelines.ingest_games._ensure_game_columns` when
+    feeding the mock payloads through :func:`utils.schema_normalizer`:
+    uppercase ``GAME_ID`` (preserved verbatim from the NBA Stats API payload
+    headers) plus lowercase ``season`` (injected by ``_ensure_game_columns``
+    because the payload headers do not carry a SEASON column). Distinctive
+    marker values (``PTS = 99`` in the games seed, ``EVENTNUM = 99`` in the
+    PBP seed) make it trivial to prove dedupe with a single set comparison.
+
+    Note on the mock client's payload shape: the ``recording_client`` fixture
+    returns the *same* hardcoded payload for every endpoint invocation
+    regardless of the ``GameID`` argument — see ``tests/conftest.py``. Every
+    PlayerStats row carried by the mock payload bears ``GAME_ID="0022500001"``
+    (the overlap GID), so the 6 freshly-fetched rows across 3 iterations all
+    share that value. The overlap ``GAME_ID`` therefore appears exactly 6
+    times in the final cumulative write — once per fresh-fetch row — with
+    zero contribution from the seed (the seed's overlap row was filtered).
+    This mirrors the happy-path test's approach of validating row-count
+    monotonicity and per-artifact accounting without asserting per-gid
+    GAME_ID values inside the DataFrame payload.
+    """
+
+    # --- Arrange ---------------------------------------------------------
+    _patch_enumerate(monkeypatch, _GAME_IDS)
+    client = recording_client(
+        responses={
+            _BOXSCORE_ENDPOINT: sample_multi_table_payload,
+            _PLAYBYPLAY_ENDPOINT: sample_playbyplay_payload,
+        }
+    )
+    writer = recording_writer(tmp_path)
+    checkpoint = recording_checkpoint()  # no prior completion for any GID
+    metrics_mock = MagicMock()
+
+    #: GAME_IDs present in the seed CSV that are NOT in the current run's
+    #: pending set — these rows must be preserved verbatim.
+    _HISTORICAL_GID_1 = "0022400098"
+    _HISTORICAL_GID_2 = "0022400099"
+
+    #: GAME_ID present in BOTH the seed CSV and the current run's pending
+    #: set — the seed row must be filtered and the fresh fetch wins.
+    _OVERLAP_GID = _GAME_IDS[0]  # "0022500001"
+
+    #: Distinctive marker value that identifies a seed row; if this value
+    #: surfaces in the fresh-fetch overlap rows of the final cumulative
+    #: write, it proves the seed dedupe failed.
+    _SEED_OVERLAP_PTS = 99
+    _SEED_OVERLAP_EVENTNUM = 99
+
+    # Seed the prior-session artifacts on disk. ``recording_writer``
+    # auto-creates ``tmp_path / "output"`` so the parent dir exists.
+    #
+    # Schema rationale: uppercase ``GAME_ID`` (matches payload headers
+    # preserved by the schema normalizer) + lowercase ``season`` (matches
+    # the column ``_ensure_game_columns`` injects). Seeding with this exact
+    # schema avoids spurious column additions or renames on the first
+    # cumulative concat performed by ``_load_existing_games`` inside the
+    # pipeline.
+    seed_games_df = pd.DataFrame(
+        [
+            {
+                "season": "2024-25",
+                "GAME_ID": _HISTORICAL_GID_1,
+                "PLAYER_ID": 201,
+                "TEAM_ID": 1610612737,
+                "PTS": 22,
+            },
+            {
+                "season": "2024-25",
+                "GAME_ID": _HISTORICAL_GID_2,
+                "PLAYER_ID": 202,
+                "TEAM_ID": 1610612738,
+                "PTS": 18,
+            },
+            {
+                # Overlap row — must be filtered by pending-ID dedupe.
+                "season": "2025-26",
+                "GAME_ID": _OVERLAP_GID,
+                "PLAYER_ID": 999,
+                "TEAM_ID": 1610612739,
+                "PTS": _SEED_OVERLAP_PTS,
+            },
+        ]
+    )
+    seed_pbp_df = pd.DataFrame(
+        [
+            {
+                "season": "2024-25",
+                "GAME_ID": _HISTORICAL_GID_1,
+                "EVENTNUM": 1,
+                "EVENTMSGTYPE": 1,
+                "PERIOD": 1,
+            },
+            {
+                "season": "2024-25",
+                "GAME_ID": _HISTORICAL_GID_2,
+                "EVENTNUM": 1,
+                "EVENTMSGTYPE": 1,
+                "PERIOD": 1,
+            },
+            {
+                # Overlap row — must be filtered by pending-ID dedupe.
+                "season": "2025-26",
+                "GAME_ID": _OVERLAP_GID,
+                "EVENTNUM": _SEED_OVERLAP_EVENTNUM,
+                "EVENTMSGTYPE": 99,
+                "PERIOD": 9,
+            },
+        ]
+    )
+
+    games_csv_path = writer.output_dir / f"{config.CSV_GAMES}.csv"
+    pbp_csv_path = writer.output_dir / f"{config.CSV_PLAY_BY_PLAY}.csv"
+    # ``DataFrame.to_csv`` is invoked from test code here — Rule 7 scopes
+    # the "sole caller of to_csv" invariant to production code under
+    # ``pipelines/``, ``endpoints/``, ``utils/``, ``run.py``, ``config.py``;
+    # test fixtures are explicitly outside that scope. The pipeline's
+    # ``_load_existing_*`` helpers will exercise the ``pd.read_csv`` side
+    # of the contract.
+    seed_games_df.to_csv(games_csv_path, index=False)
+    seed_pbp_df.to_csv(pbp_csv_path, index=False)
+
+    # --- Act -------------------------------------------------------------
+    ingest_games.run(
+        client=client,
+        writer=writer,
+        checkpoint=checkpoint,
+        season=_SEASON,
+        metrics=metrics_mock,
+    )
+
+    # --- Assert ----------------------------------------------------------
+
+    # (1) Fetch pattern unchanged: even with seed CSVs present, every
+    #     pending game ID is fetched exactly once for boxscore and once for
+    #     PBP, in iteration order. Seeding does NOT suppress API calls —
+    #     only the checkpoint suppresses them (Rule 5).
+    assert len(client.calls) == 6, (
+        f"expected 6 client calls (2 endpoints × 3 games); "
+        f"got {len(client.calls)}: {client.calls!r}"
+    )
+    for i, gid in enumerate(_GAME_IDS):
+        assert client.calls[2 * i][0] == _BOXSCORE_ENDPOINT, (
+            f"game {i} expected boxscore endpoint; got {client.calls[2 * i][0]!r}"
+        )
+        assert client.calls[2 * i][1].get("GameID") == gid, (
+            f"game {i} boxscore call expected GameID={gid!r}; "
+            f"got {client.calls[2 * i][1]!r}"
+        )
+        assert client.calls[2 * i + 1][0] == _PLAYBYPLAY_ENDPOINT, (
+            f"game {i} expected PBP endpoint; "
+            f"got {client.calls[2 * i + 1][0]!r}"
+        )
+        assert client.calls[2 * i + 1][1].get("GameID") == gid, (
+            f"game {i} PBP call expected GameID={gid!r}; "
+            f"got {client.calls[2 * i + 1][1]!r}"
+        )
+
+    # (2) Writer was invoked 6 times (3 games × 2 artifacts), alternating
+    #     ``games`` then ``play_by_play`` — same cadence as the happy path.
+    #     Seeding adds no extra writes; the seed contributes rows to the
+    #     in-memory buffer, not additional writer calls.
+    assert len(writer.writes) == 6, (
+        f"expected 6 writer.write invocations; got {len(writer.writes)}: "
+        f"names={[w['name'] for w in writer.writes]!r}"
+    )
+    for i, write in enumerate(writer.writes):
+        expected_name = (
+            config.CSV_GAMES if i % 2 == 0 else config.CSV_PLAY_BY_PLAY
+        )
+        assert write["name"] == expected_name, (
+            f"write[{i}] expected name={expected_name!r}; got {write['name']!r}"
+        )
+        assert write["season"] == _SEASON, (
+            f"write[{i}] expected season={_SEASON!r}; got {write['season']!r}"
+        )
+
+    games_writes = [w for w in writer.writes if w["name"] == config.CSV_GAMES]
+    pbp_writes = [
+        w for w in writer.writes if w["name"] == config.CSV_PLAY_BY_PLAY
+    ]
+    assert len(games_writes) == 3, (
+        f"expected 3 games writes (1 per pending game); got {len(games_writes)}"
+    )
+    assert len(pbp_writes) == 3, (
+        f"expected 3 pbp writes (1 per pending game); got {len(pbp_writes)}"
+    )
+
+    # (3) Monotonic cumulative growth.
+    #
+    #     Seed contribution after dedupe:
+    #       games:  3 seed rows - 1 overlap row filtered = 2 preserved rows
+    #       pbp:    3 seed rows - 1 overlap row filtered = 2 preserved rows
+    #
+    #     Fresh fetches per iteration (from the mock payloads):
+    #       games:  2 rows per boxscore fetch  (PlayerStats: 2 rows)
+    #       pbp:    3 rows per PBP fetch       (PlayByPlay: 3 rows)
+    #
+    #     Expected per-iteration cumulative totals:
+    #       games_writes[i].rows = 2 (seed) + 2 * (i + 1)  for i in 0..2
+    #         → [4, 6, 8]
+    #       pbp_writes[i].rows   = 2 (seed) + 3 * (i + 1)  for i in 0..2
+    #         → [5, 8, 11]
+    games_row_counts = [w["rows"] for w in games_writes]
+    pbp_row_counts = [w["rows"] for w in pbp_writes]
+    assert games_row_counts == [4, 6, 8], (
+        f"expected games cumulative row counts [4, 6, 8] "
+        f"(2 preserved seed rows + 2×N fresh rows from {_BOXSCORE_ENDPOINT} "
+        f"across 3 iterations); got {games_row_counts!r}"
+    )
+    assert pbp_row_counts == [5, 8, 11], (
+        f"expected pbp cumulative row counts [5, 8, 11] "
+        f"(2 preserved seed rows + 3×N fresh rows from {_PLAYBYPLAY_ENDPOINT} "
+        f"across 3 iterations); got {pbp_row_counts!r}"
+    )
+
+    # (4) History preservation: every cumulative write — including the
+    #     very first one, which is written mid-iteration — contains both
+    #     historical ``GAME_ID`` values verbatim from the seed.
+    def _resolve_col(df: pd.DataFrame, canonical: str) -> str:
+        """Case-insensitive column lookup; mirrors ``_load_existing_*`` logic."""
+        for col in df.columns:
+            if col.lower() == canonical.lower():
+                return col
+        raise AssertionError(
+            f"expected a column matching {canonical!r} (case-insensitive); "
+            f"got columns={list(df.columns)!r}"
+        )
+
+    for idx, write in enumerate(games_writes):
+        df = write["df"]
+        gid_col = _resolve_col(df, "GAME_ID")
+        gids_in_write = set(df[gid_col].astype(str).tolist())
+        assert _HISTORICAL_GID_1 in gids_in_write, (
+            f"games_writes[{idx}] missing historical GID {_HISTORICAL_GID_1!r}; "
+            f"seed-history preservation broken. GIDs in write: "
+            f"{sorted(gids_in_write)!r}"
+        )
+        assert _HISTORICAL_GID_2 in gids_in_write, (
+            f"games_writes[{idx}] missing historical GID {_HISTORICAL_GID_2!r}; "
+            f"seed-history preservation broken. GIDs in write: "
+            f"{sorted(gids_in_write)!r}"
+        )
+
+    for idx, write in enumerate(pbp_writes):
+        df = write["df"]
+        gid_col = _resolve_col(df, "GAME_ID")
+        gids_in_write = set(df[gid_col].astype(str).tolist())
+        assert _HISTORICAL_GID_1 in gids_in_write, (
+            f"pbp_writes[{idx}] missing historical GID {_HISTORICAL_GID_1!r}; "
+            f"seed-history preservation broken. GIDs in write: "
+            f"{sorted(gids_in_write)!r}"
+        )
+        assert _HISTORICAL_GID_2 in gids_in_write, (
+            f"pbp_writes[{idx}] missing historical GID {_HISTORICAL_GID_2!r}; "
+            f"seed-history preservation broken. GIDs in write: "
+            f"{sorted(gids_in_write)!r}"
+        )
+
+    # (5) Refresh-aware dedupe: the final cumulative write is the
+    #     strongest evidence of the contract because it represents the
+    #     on-disk CSV shape after the run completes. In the final games
+    #     write, the overlap GAME_ID must appear exactly 6 times — all
+    #     from fresh fetches (2 rows × 3 iterations). Zero contribution
+    #     from the seed overlap row, which was filtered out of the
+    #     preserved set by ``_load_existing_games``'s pending-ID filter.
+    final_games_df = games_writes[-1]["df"]
+    games_gid_col = _resolve_col(final_games_df, "GAME_ID")
+    overlap_rows_games = final_games_df[
+        final_games_df[games_gid_col].astype(str) == _OVERLAP_GID
+    ]
+    assert len(overlap_rows_games) == 6, (
+        f"expected exactly 6 rows with GAME_ID={_OVERLAP_GID!r} in the final "
+        f"games write (2 PlayerStats rows per payload × 3 iterations = 6, "
+        f"with the seed overlap row filtered by pending-ID dedupe); "
+        f"got {len(overlap_rows_games)}. A value of 7 would indicate the "
+        f"seed overlap row was not filtered (dedupe regression). A value "
+        f"other than 6 or 7 would indicate a deeper buffer-management "
+        f"regression."
+    )
+
+    games_pts_col = _resolve_col(final_games_df, "PTS")
+    # pandas may read CSV PTS values as numpy int64; coerce to plain Python
+    # ints so the set comparison is stable across pandas versions.
+    overlap_pts = {int(v) for v in overlap_rows_games[games_pts_col].tolist()}
+    # The mock ``PlayerStats`` payload has PTS values {28, 35}. If the seed
+    # overlap row (PTS=99) survived, 99 would appear in this set.
+    assert overlap_pts == {28, 35}, (
+        f"expected overlap-GID rows in the final games write to carry only "
+        f"PTS values from the fresh PlayerStats payload ({{28, 35}}); "
+        f"got {sorted(overlap_pts)!r}. Presence of {_SEED_OVERLAP_PTS} "
+        f"indicates the seed overlap row (GAME_ID={_OVERLAP_GID!r}, "
+        f"PTS={_SEED_OVERLAP_PTS}) was not filtered by the resume dedupe "
+        f"logic — a direct regression of QA FC-1 Issue 2."
+    )
+    assert _SEED_OVERLAP_PTS not in overlap_pts, (
+        f"seed-overlap marker PTS={_SEED_OVERLAP_PTS} must not survive into "
+        f"the final write; its presence proves the ``_load_existing_games`` "
+        f"pending-ID dedupe filter is broken."
+    )
+
+    # (6) Same dedupe contract for play-by-play: overlap GAME_ID must
+    #     appear exactly 9 times (3 PBP rows per payload × 3 iterations)
+    #     and the seed overlap row's distinctive EVENTNUM=99 must not
+    #     survive.
+    final_pbp_df = pbp_writes[-1]["df"]
+    pbp_gid_col = _resolve_col(final_pbp_df, "GAME_ID")
+    overlap_rows_pbp = final_pbp_df[
+        final_pbp_df[pbp_gid_col].astype(str) == _OVERLAP_GID
+    ]
+    assert len(overlap_rows_pbp) == 9, (
+        f"expected exactly 9 rows with GAME_ID={_OVERLAP_GID!r} in the final "
+        f"pbp write (3 PlayByPlay rows per payload × 3 iterations = 9, with "
+        f"the seed overlap row filtered by pending-ID dedupe); "
+        f"got {len(overlap_rows_pbp)}. 10 would indicate dedupe regression."
+    )
+
+    pbp_eventnum_col = _resolve_col(final_pbp_df, "EVENTNUM")
+    overlap_eventnums = {
+        int(v) for v in overlap_rows_pbp[pbp_eventnum_col].tolist()
+    }
+    # The mock ``PlayByPlay`` payload has EVENTNUM values {1, 2, 3}.
+    assert overlap_eventnums == {1, 2, 3}, (
+        f"expected overlap-GID rows in the final pbp write to carry only "
+        f"EVENTNUM values from the fresh PlayByPlay payload ({{1, 2, 3}}); "
+        f"got {sorted(overlap_eventnums)!r}. Presence of "
+        f"{_SEED_OVERLAP_EVENTNUM} indicates the seed overlap row was not "
+        f"filtered by the resume dedupe logic."
+    )
+
+    # (7) Rule 5 checkpoint determinism: exactly one mark_completed call
+    #     per pending GAME_ID, in iteration order. Resume semantics must
+    #     not alter the per-game ordering.
+    expected_marks = [(config.DOMAIN_GAMES, gid) for gid in _GAME_IDS]
+    assert checkpoint.marks == expected_marks, (
+        f"expected one checkpoint mark per pending game in iteration order; "
+        f"expected={expected_marks!r}, got={checkpoint.marks!r}"
+    )
+
+    # (8) Pending probe: pipeline asked the checkpoint for the pending set
+    #     exactly once, for the full set of enumerated GAME_IDs.
+    assert len(checkpoint.pendings) == 1, (
+        f"expected exactly one get_pending probe; "
+        f"got {len(checkpoint.pendings)}: {checkpoint.pendings!r}"
+    )
+    assert checkpoint.pendings[0] == (
+        config.DOMAIN_GAMES,
+        tuple(_GAME_IDS),
+    ), (
+        f"pending probe was called with unexpected arguments; "
+        f"got {checkpoint.pendings[0]!r}"
+    )
+
+    # (9) Metrics: pipeline emitted exactly 3 ``pipeline_rows_written_total``
+    #     increments per artifact (one per per-game write). Each increment
+    #     carries a positive ``n`` kwarg reflecting the *fresh* rows
+    #     appended by that iteration — NOT the cumulative buffer size —
+    #     because metrics semantics describe deltas, not snapshots.
+    row_inc_calls = [
+        c
+        for c in metrics_mock.inc.call_args_list
+        if c.args and c.args[0] == "pipeline_rows_written_total"
+    ]
+    games_inc_calls = [
+        c
+        for c in row_inc_calls
+        if len(c.args) >= 2
+        and c.args[1]
+        == {"pipeline": "ingest_games", "artifact": f"{config.CSV_GAMES}.csv"}
+    ]
+    pbp_inc_calls = [
+        c
+        for c in row_inc_calls
+        if len(c.args) >= 2
+        and c.args[1]
+        == {
+            "pipeline": "ingest_games",
+            "artifact": f"{config.CSV_PLAY_BY_PLAY}.csv",
+        }
+    ]
+    assert len(games_inc_calls) == 3, (
+        f"expected 3 games-artifact row-written increments (one per game); "
+        f"got {len(games_inc_calls)}"
+    )
+    assert len(pbp_inc_calls) == 3, (
+        f"expected 3 pbp-artifact row-written increments (one per game); "
+        f"got {len(pbp_inc_calls)}"
+    )
+    for c in games_inc_calls + pbp_inc_calls:
+        assert "n" in c.kwargs, (
+            f"pipeline_rows_written_total increment missing ``n`` kwarg: "
+            f"{c!r}"
+        )
+        assert c.kwargs["n"] > 0, (
+            f"pipeline_rows_written_total increment had non-positive n: {c!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Test 4 — Rule 5 ordering (mark_completed follows writes per game)
 # ---------------------------------------------------------------------------
 
 
@@ -636,7 +1095,7 @@ def test_rule5_mark_completed_follows_writes_per_game(
 
 
 # ---------------------------------------------------------------------------
-# Test 4 — Negative-space guard (forbidden endpoints)
+# Test 5 — Negative-space guard (forbidden endpoints)
 # ---------------------------------------------------------------------------
 
 

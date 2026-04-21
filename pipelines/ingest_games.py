@@ -94,18 +94,29 @@ Resume semantics
 On resume, :meth:`utils.checkpoint.CheckpointManager.get_pending`
 returns only the not-yet-processed ``GAME_IDs`` in their original
 first-seen order. In-memory buffers (``games_buffer`` and
-``pbp_buffer``) start empty on every invocation; the on-disk CSVs
-are overwritten atomically after every successful per-game pull so
-the file on disk always reflects the set of games processed in the
-current session (not the cumulative set across all sessions).
+``pbp_buffer``) are seeded from the existing on-disk CSVs via the
+:func:`_load_existing_games` and :func:`_load_existing_pbp`
+helpers before per-game iteration begins, so the on-disk CSVs
+after resume reflect the **cumulative** set of games processed
+across all sessions (prior session's rows + current session's
+rows), not just the current session's games. This is history-
+preserving resume behaviour.
 
-This is an intentional simplification of the minimum-viable
-implementation. A fully history-preserving resume would require
-seeding the buffers from the existing CSVs at the top of
-:func:`run` (``pandas.read_csv`` is permitted by Rule 7 — only
-``DataFrame.to_csv`` is forbidden in pipelines). A future iteration
-can add a ``_load_existing`` helper to the run() preamble for that
-behaviour without changing the Rule 6 loop body.
+The seeding step uses :func:`pandas.read_csv` — which is permitted
+in pipelines by Rule 7 (only :meth:`pandas.DataFrame.to_csv` is
+forbidden outside :mod:`storage.csv_writer`). Rows whose
+``game_id`` is present in the current run's ``pending`` list are
+filtered out during seeding, so if a prior session wrote a game's
+rows to disk but the checkpoint mark failed (a rare inconsistency
+that leaves the ``GAME_ID`` in ``pending``), the retry will not
+produce duplicate rows in the final CSV. If the on-disk CSVs are
+missing, empty, or unreadable, the helpers fall back to an empty
+list and log a WARNING — the pipeline never fails merely because
+a stale CSV artifact cannot be parsed. Helper invocations occur
+in the ``run()`` preamble, **outside** the per-game try/except,
+so failures in the helpers still propagate fatally (consistent
+with the enumerate/get_pending contracts); only per-game fetch/
+normalize/write failures are swallowed by Rule 6.
 
 Observability
 -------------
@@ -317,6 +328,240 @@ def _ensure_game_columns(
     return out
 
 
+def _load_existing_games(
+    output_dir: "pd.api.types.Any",  # type: ignore[name-defined]
+    season: str,
+    pending_ids: List[str],
+    log: logging.LoggerAdapter,
+) -> List[pd.DataFrame]:
+    """Seed the games-buffer from a prior session's ``games.csv``.
+
+    Implements the history-preserving side of the resume contract
+    documented in the module docstring's "Resume semantics" section.
+    Reads an existing ``<output_dir>/games.csv`` (if one is present)
+    and returns it as a single-element list suitable for prepending
+    to the in-memory ``games_buffer`` before per-game iteration
+    begins.
+
+    Rule 7 compliance
+    -----------------
+    This helper uses :func:`pandas.read_csv`, which is **permitted**
+    in pipeline modules. Rule 7 forbids only
+    :meth:`pandas.DataFrame.to_csv` outside
+    :mod:`storage.csv_writer`; reading CSVs is unrestricted
+    (AAP §0.7.2.7 binding invariant text).
+
+    Dedupe semantics
+    ----------------
+    Rows whose ``game_id`` column matches any entry in
+    ``pending_ids`` are filtered out before return. This protects
+    against the pathological case where a prior session wrote a
+    per-game slice to ``games.csv`` but crashed before
+    :meth:`utils.checkpoint.CheckpointManager.mark_completed`
+    persisted the entry — on the next run that ``GAME_ID`` would
+    appear in ``pending`` and be re-fetched, which would duplicate
+    its rows in the concatenated buffer without this dedupe step.
+    The lowercase ``game_id`` column is guaranteed by
+    :func:`_ensure_game_columns`; a case-insensitive fallback is
+    applied defensively in case an older on-disk artifact was
+    written under a different casing convention.
+
+    Failure posture
+    ---------------
+    Any failure to locate, parse, or filter the existing CSV is
+    swallowed and a WARNING is logged; the function returns an
+    empty list in that case. The pipeline continues normally —
+    losing only the benefit of the prior-session rows (which will
+    not be re-fetched because they remain checkpointed), not the
+    ability to process the ``pending`` ``GAME_IDs``. This is
+    consistent with the "best-effort resume enrichment" posture
+    required to keep the Rule 6 invariants meaningful.
+
+    Parameters
+    ----------
+    output_dir:
+        Filesystem directory under which ``games.csv`` is expected
+        to live. Accepts any object exposing an ``os.PathLike``
+        interface (both :class:`pathlib.Path` from
+        :class:`storage.csv_writer.CSVWriter.output_dir` and a
+        plain :class:`pathlib.Path` attribute from the test
+        ``RecordingWriter``).
+    season:
+        Season string passed through for logging only; rows in the
+        CSV are NOT filtered by ``season`` because the CSV is
+        season-scoped by convention (one season per run per
+        output directory).
+    pending_ids:
+        The list returned by
+        :meth:`utils.checkpoint.CheckpointManager.get_pending` for
+        the ``games`` domain. Used to dedupe rows from the existing
+        CSV whose ``game_id`` is scheduled for re-processing in the
+        current run.
+    log:
+        Logger adapter used for the WARNING emission path.
+
+    Returns
+    -------
+    list of pandas.DataFrame
+        Either a single-element list containing the filtered
+        prior-session DataFrame, or an empty list if no prior
+        artifact exists or an unrecoverable parse error occurred.
+    """
+    from pathlib import Path
+
+    try:
+        path = Path(output_dir) / f"{config.CSV_GAMES}.csv"
+        if not path.is_file():
+            return []
+        # ``dtype={'game_id': str}`` preserves leading zeros in the
+        # 10-character zero-padded NBA GAME_ID convention (e.g.
+        # ``"0022500001"``) — pandas would otherwise coerce to int64
+        # and silently drop the prefix.
+        df = pd.read_csv(path, dtype={"game_id": str})
+        if df.empty:
+            return []
+        # Normalize the game_id column name case for dedupe.
+        gid_col: Optional[str] = None
+        for col in df.columns:
+            if col.lower() == "game_id":
+                gid_col = col
+                break
+        if gid_col is None:
+            log.warning(
+                "pipeline.games.resume.seed_games_skipped"
+                " reason=missing_game_id_column path=%s",
+                path,
+            )
+            return []
+        # Preserve the 10-character zero-padded NBA GAME_ID convention
+        # even when pandas's default type inference coerced the column
+        # to int64. This happens whenever the prior-session CSV stores
+        # the id as uppercase ``GAME_ID`` (the runtime default) so the
+        # ``dtype={'game_id': str}`` hint above is silently ignored.
+        # Without this normalization the dedupe comparison below would
+        # never match (e.g. upstream pending id ``"0022500001"`` vs
+        # stripped-prefix cell value ``"22500001"``) and overlap rows
+        # would incorrectly survive into the cumulative write.
+        df[gid_col] = df[gid_col].astype(str).str.zfill(10)
+        # Filter out rows whose GAME_ID will be re-processed this run.
+        if pending_ids:
+            pending_set = set(pending_ids)
+            df = df[~df[gid_col].isin(pending_set)].copy()
+        if df.empty:
+            log.info(
+                "pipeline.games.resume.seed_games path=%s rows=0"
+                " reason=all_rows_filtered",
+                path,
+            )
+            return []
+        log.info(
+            "pipeline.games.resume.seed_games path=%s rows=%d season=%s",
+            path,
+            len(df),
+            season,
+        )
+        return [df]
+    except Exception as exc:  # pragma: no cover - defensive fallback
+        # Intentionally broad catch: a corrupted CSV or transient I/O
+        # error must not abort the pipeline. Resume behaviour remains
+        # correct — only the history-preserving enrichment is lost.
+        log.warning(
+            "pipeline.games.resume.seed_games_failed"
+            " reason=%s season=%s",
+            type(exc).__name__,
+            season,
+        )
+        return []
+
+
+def _load_existing_pbp(
+    output_dir: "pd.api.types.Any",  # type: ignore[name-defined]
+    season: str,
+    pending_ids: List[str],
+    log: logging.LoggerAdapter,
+) -> List[pd.DataFrame]:
+    """Seed the play-by-play buffer from a prior session's CSV.
+
+    Mirror of :func:`_load_existing_games` for the ``play_by_play.csv``
+    artifact. See that function's docstring for the full rationale,
+    Rule 7 compliance discussion, dedupe semantics, and failure
+    posture — they apply identically here.
+
+    Parameters
+    ----------
+    output_dir:
+        Filesystem directory under which ``play_by_play.csv`` is
+        expected to live.
+    season:
+        Season string (for logging only).
+    pending_ids:
+        The ``games`` domain pending list — the same list used for
+        the games-CSV seed. Rows whose ``game_id`` matches are
+        filtered out so re-processed games do not produce duplicate
+        play-by-play rows.
+    log:
+        Logger adapter for the WARNING emission path.
+
+    Returns
+    -------
+    list of pandas.DataFrame
+        Either a single-element list containing the filtered
+        prior-session play-by-play DataFrame, or an empty list if
+        no prior artifact exists or an unrecoverable parse error
+        occurred.
+    """
+    from pathlib import Path
+
+    try:
+        path = Path(output_dir) / f"{config.CSV_PLAY_BY_PLAY}.csv"
+        if not path.is_file():
+            return []
+        df = pd.read_csv(path, dtype={"game_id": str})
+        if df.empty:
+            return []
+        gid_col: Optional[str] = None
+        for col in df.columns:
+            if col.lower() == "game_id":
+                gid_col = col
+                break
+        if gid_col is None:
+            log.warning(
+                "pipeline.games.resume.seed_pbp_skipped"
+                " reason=missing_game_id_column path=%s",
+                path,
+            )
+            return []
+        # Preserve leading zeros in GAME_ID for case-insensitive
+        # dedupe parity with ``_load_existing_games``. See that
+        # helper for the full rationale.
+        df[gid_col] = df[gid_col].astype(str).str.zfill(10)
+        if pending_ids:
+            pending_set = set(pending_ids)
+            df = df[~df[gid_col].isin(pending_set)].copy()
+        if df.empty:
+            log.info(
+                "pipeline.games.resume.seed_pbp path=%s rows=0"
+                " reason=all_rows_filtered",
+                path,
+            )
+            return []
+        log.info(
+            "pipeline.games.resume.seed_pbp path=%s rows=%d season=%s",
+            path,
+            len(df),
+            season,
+        )
+        return [df]
+    except Exception as exc:  # pragma: no cover - defensive fallback
+        log.warning(
+            "pipeline.games.resume.seed_pbp_failed"
+            " reason=%s season=%s",
+            type(exc).__name__,
+            season,
+        )
+        return []
+
+
 # ---------------------------------------------------------------------------
 # Public entry point — the Rule 6 fail-safe iteration body
 # ---------------------------------------------------------------------------
@@ -496,6 +741,28 @@ def run(
         )
         return
 
+    # ---- Seed buffers from prior-session CSVs (history-preserving resume) ----
+    # AAP §0.7.2.7 (Rule 7): only ``DataFrame.to_csv`` is forbidden
+    # outside ``storage/csv_writer.py`` — reading CSVs via
+    # :func:`pandas.read_csv` is explicitly permitted in pipeline
+    # modules. Seeding the buffers from the existing artifacts
+    # before per-game iteration preserves rows written by prior
+    # sessions, so an interrupted run that resumes produces a CSV
+    # containing **both** the prior-session rows and the current-
+    # session rows (not only the current-session rows). The
+    # helpers defend against any parse error with an empty-list
+    # fallback + WARNING so a stale or corrupted on-disk artifact
+    # cannot abort the pipeline. Helpers run OUTSIDE the per-game
+    # try/except to preserve the Rule 6 scope boundary — only
+    # per-game fetch/normalize/write failures are swallowed.
+    writer_output_dir = getattr(writer, "output_dir", config.OUTPUT_DIR)
+    games_buffer: List[pd.DataFrame] = _load_existing_games(
+        writer_output_dir, season, pending, log,
+    )
+    pbp_buffer: List[pd.DataFrame] = _load_existing_pbp(
+        writer_output_dir, season, pending, log,
+    )
+
     # ---- Per-game iteration with Rule 6 fail-safe try/except ----
     # Buffers accumulate per-game DataFrames in-memory; after every
     # successful per-game pull the full buffer is re-written to
@@ -503,8 +770,6 @@ def run(
     # full 1,230-game season but is dominated by the Rule 2
     # 1.0-second rate-limit sleep (≥ 1,230 seconds of forced
     # latency), so the incremental write is not the bottleneck.
-    games_buffer: List[pd.DataFrame] = []
-    pbp_buffer: List[pd.DataFrame] = []
     processed = 0
     failed = 0
 
