@@ -201,6 +201,7 @@ This section is the bottom-up view. For every file in the repository plan, it li
 | `tests/unit/utils/test_schema_normalizer.py` | F-005 | Rule 4 | Gate 1 |
 | `tests/unit/utils/test_checkpoint.py` | F-007 | Rule 5 | Gate 8 |
 | `tests/unit/utils/test_logger.py` | F-008 | — | Gate 2 |
+| `tests/unit/utils/test_correlation.py` | F-008 (Observability extension) | — | — |
 | `tests/unit/utils/test_metrics.py` | Observability | — | — |
 | `tests/unit/utils/test_health.py` | Observability | — | — |
 | `tests/integration/test_gate1_all_live.py` | F-009 … F-013 | Rule 1, Rule 2, Rule 3, Rule 4, Rule 5, Rule 7 | Gate 1 |
@@ -274,7 +275,7 @@ Run these greps from the repository root to confirm 100% coverage has not regres
 | Operational rules (1 … 8) | 8 | Section 4 |
 | Validation gates (1, 2, 8, 9, 10, 12, 13) | 7 | Section 5 |
 | Source files in Reverse Index | 26 (CLI 1 + Config 1 + Transport 2 + Endpoints 6 + Pipelines 6 + Storage 2 + Utilities 8 — `__init__.py` included) | Section 6 |
-| Test files in Reverse Index | 26 (unit 20 + integration 2 + invariants 3 + `conftest.py` 1 — `__init__.py` package markers omitted) | Section 6 |
+| Test files in Reverse Index | 27 (unit 21 + integration 2 + invariants 3 + `conftest.py` 1 — `__init__.py` package markers omitted) | Section 6 |
 | CSV artifacts | 7 | Section 6 Runtime Artifacts |
 
 If these counts drift without a corresponding update to this document, the matrix has decayed and Gate 10 must fail until restored.

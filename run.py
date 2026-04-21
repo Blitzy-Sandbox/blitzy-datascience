@@ -406,14 +406,8 @@ def schedule(season: str) -> None:
 # Aggregate ``all`` subcommand
 #
 # The ordering schedule → games → teams → players → lineups is BINDING
-# per AAP §0.4.5. Rationale:
-#   * schedule must run first because games depends on its GAME_ID
-#     enumeration (when consumed as a single ``all`` invocation, games
-#     can reuse schedule's freshly-materialized state in-memory).
-#   * games must run second so schedule-induced GAME_ID discovery is
-#     still fresh in the cache / checkpoint manifest.
-#   * teams, players, lineups have no cross-dependencies; the AAP fixes
-#     their order for determinism and for operator predictability.
+# per AAP §0.4.5. See docs/DECISIONS.md D-008 for the full rationale and
+# dependency analysis.
 # ---------------------------------------------------------------------------
 
 

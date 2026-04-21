@@ -308,7 +308,7 @@ Prints a JSON object indicating process liveness:
   "status": "ok",
   "timestamp": "2026-04-19T12:03:44+00:00",
   "python_version": "3.12.3",
-  "component": "nba-ingestion"
+  "component": "nba-data-ingestion-pipeline"
 }
 ```
 
@@ -332,10 +332,10 @@ Output on success:
   "status": "ready",
   "timestamp": "2026-04-19T12:03:44+00:00",
   "checks": {
-    "output_dir_writable": {"status": "ok", "detail": "wrote and removed temp file under output/"},
-    "required_headers_present": {"status": "ok", "detail": "Referer and User-Agent present"},
-    "rate_limit_configured": {"status": "ok", "detail": "RATE_LIMIT_SECONDS=1.0 meets Rule 2 floor"},
-    "checkpoint_parseable": {"status": "ok", "detail": "checkpoint.json parsed successfully"}
+    "output_dir_writable": {"status": "ok", "detail": "Wrote and deleted probe file under output"},
+    "required_headers_present": {"status": "ok", "detail": "8 headers configured"},
+    "rate_limit_configured": {"status": "ok", "detail": "RATE_LIMIT_SECONDS=1.0"},
+    "checkpoint_parseable": {"status": "ok", "detail": "Checkpoint parsed; N domains tracked"}
   }
 }
 ```
@@ -348,9 +348,9 @@ Output on failure:
   "timestamp": "2026-04-19T12:03:44+00:00",
   "checks": {
     "output_dir_writable": {"status": "fail", "detail": "Permission denied: 'output/'"},
-    "required_headers_present": {"status": "ok", "detail": "Referer and User-Agent present"},
-    "rate_limit_configured": {"status": "ok", "detail": "RATE_LIMIT_SECONDS=1.0 meets Rule 2 floor"},
-    "checkpoint_parseable": {"status": "ok", "detail": "checkpoint.json not present"}
+    "required_headers_present": {"status": "ok", "detail": "8 headers configured"},
+    "rate_limit_configured": {"status": "ok", "detail": "RATE_LIMIT_SECONDS=1.0"},
+    "checkpoint_parseable": {"status": "ok", "detail": "No checkpoint file (fresh run)"}
   }
 }
 ```
