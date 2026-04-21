@@ -117,7 +117,7 @@ Style conventions
 
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 from unittest.mock import MagicMock
 
 import pytest  # noqa: F401  (imported to satisfy Phase 1 header convention)
@@ -218,6 +218,17 @@ class _SelectiveFailureClient:
         ``_BOXSCORE_ENDPOINT`` (the first upstream call per game in
         the pipeline — making the failure deterministic *before* any
         write or checkpoint work begins).
+    exception_factory:
+        Callable that receives the auto-generated failure message and
+        returns a :class:`BaseException` instance to raise. Defaults
+        to :class:`RuntimeError` (preserving pre-existing behaviour).
+        Exception *classes* are themselves callables of the required
+        shape, so passing ``exception_factory=KeyError`` produces
+        ``KeyError("simulated ...")``. This hook is what enables
+        :meth:`TestRule6FailSafe.test_rule6_tolerates_arbitrary_exception_types`
+        to prove Rule 6's ``except Exception`` handler is
+        exception-type-agnostic by parametrizing across ``RuntimeError``,
+        ``KeyError``, ``IndexError``, and ``ValueError``.
     """
 
     def __init__(
@@ -225,10 +236,21 @@ class _SelectiveFailureClient:
         responses: Dict[str, Dict[str, Any]],
         failing_game_ids: Iterable[str],
         failing_endpoint: str = _BOXSCORE_ENDPOINT,
+        exception_factory: Optional[Callable[[str], BaseException]] = None,
     ) -> None:
         self.responses: Dict[str, Dict[str, Any]] = dict(responses)
         self.failing_game_ids = set(failing_game_ids)
         self.failing_endpoint = str(failing_endpoint)
+        # Default to ``RuntimeError`` to preserve the historical
+        # failure type used by :meth:`TestRule6FailSafe.test_single_game_failure_continues_iteration`
+        # and :meth:`TestRule6FailSafe.test_all_games_fail_does_not_abort_pipeline`.
+        # Exception classes are themselves callables of shape
+        # ``(str) -> BaseException``, so the parametrized test can pass
+        # any concrete subclass (KeyError, IndexError, ValueError, …)
+        # directly.
+        self.exception_factory: Callable[[str], BaseException] = (
+            exception_factory if exception_factory is not None else RuntimeError
+        )
         self.calls: List[tuple] = []
 
     def get(
@@ -238,7 +260,13 @@ class _SelectiveFailureClient:
         self.calls.append((str(endpoint), dict(params or {})))
         game_id = (params or {}).get("GameID")
         if endpoint == self.failing_endpoint and game_id in self.failing_game_ids:
-            raise RuntimeError(
+            # Build the exception via ``exception_factory`` so that
+            # subclass-agnostic Rule 6 tests can inject arbitrary
+            # :class:`Exception` subclasses without having to subclass
+            # this helper. The message format is identical regardless
+            # of the injected type, keeping the WARNING log assertions
+            # stable across parametrizations.
+            raise self.exception_factory(
                 f"simulated {endpoint} failure for GAME_ID={game_id}"
             )
         if endpoint in self.responses:
@@ -887,6 +915,174 @@ class TestRule6FailSafe:
         assert fmt == "game %s failed: %s", (
             f"Rule 6 WARNING format string mismatch; "
             f"expected 'game %%s failed: %%s'; got {fmt!r}"
+        )
+        assert args[0] == failing_gid, (
+            f"WARNING first positional arg must be failing GAME_ID; "
+            f"expected {failing_gid!r}; got {args[0]!r}"
+        )
+
+    # -----------------------------------------------------------------
+    # Rule 6 — exception-type-agnosticism (parametrized)
+    # -----------------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        "exception_cls",
+        [RuntimeError, KeyError, IndexError, ValueError],
+        ids=["RuntimeError", "KeyError", "IndexError", "ValueError"],
+    )
+    def test_rule6_tolerates_arbitrary_exception_types(
+        self,
+        exception_cls: type,
+        monkeypatch: pytest.MonkeyPatch,
+        recording_writer,
+        recording_checkpoint,
+        sample_multi_table_payload: Dict[str, Any],
+        sample_playbyplay_payload: Dict[str, Any],
+        tmp_path,
+    ) -> None:
+        """Rule 6's ``except Exception`` catches every :class:`Exception` subclass.
+
+        Proves exception-type-agnosticism by parametrizing the injected
+        failure across four common standard-library exception classes:
+        :class:`RuntimeError`, :class:`KeyError`, :class:`IndexError`,
+        and :class:`ValueError`. For each type, the pipeline must:
+
+          1. Not re-raise — Rule 6 catches the exception at the per-game
+             boundary regardless of concrete class.
+          2. Process and checkpoint G1 and G3 (the two successful games)
+             normally — demonstrating the ``continue`` branch does not
+             corrupt iteration state.
+          3. Leave the failing G2 UNMARKED — ``mark_completed`` is inside
+             the ``try`` block, so a failure must prevent the checkpoint
+             write.
+          4. Increment ``games_failed_total`` exactly once with the
+             positional label ``{"reason": exception_cls.__name__}`` —
+             confirming the bounded-cardinality contract at AAP §0.5.1.6
+             holds uniformly across all four injected types (the label
+             value is the exception *class name*, not the failing
+             GAME_ID).
+          5. Emit exactly one WARNING log with the Rule 6 format string
+             ``"game %s failed: %s"`` carrying the failing GAME_ID.
+
+        This test is the dedicated regression shield against a refactor
+        that narrows the handler from ``except Exception`` to a specific
+        subclass (e.g., ``except RuntimeError``) —
+        :meth:`test_single_game_failure_continues_iteration` covers only
+        the ``RuntimeError`` case, so a narrowing refactor could pass
+        that test while silently breaking ``KeyError``/``IndexError``/
+        ``ValueError`` handling. This parametrized test catches that.
+        """
+        # --- Arrange ---------------------------------------------------
+        _patch_enumerate(monkeypatch, _GAME_IDS)
+        failing_gid = _GAME_IDS[1]
+        # ``_SelectiveFailureClient`` accepts ``exception_factory`` so
+        # each parametrization injects a different exception class at
+        # the transport seam without bypassing the ``client.get``
+        # boundary — mirroring how a real upstream failure (HTTP error,
+        # JSON decode error, key-lookup on a malformed envelope) would
+        # surface to the pipeline.
+        client = _SelectiveFailureClient(
+            responses={
+                _BOXSCORE_ENDPOINT: sample_multi_table_payload,
+                _PLAYBYPLAY_ENDPOINT: sample_playbyplay_payload,
+            },
+            failing_game_ids=[failing_gid],
+            exception_factory=exception_cls,
+        )
+        writer = recording_writer(tmp_path)
+        checkpoint = recording_checkpoint()
+        metrics_mock = MagicMock()
+        logger_mock = MagicMock()
+
+        # --- Act — MUST NOT RAISE regardless of exception type ---------
+        try:
+            ingest_games.run(
+                client=client,
+                writer=writer,
+                checkpoint=checkpoint,
+                season=_SEASON,
+                logger=logger_mock,
+                metrics=metrics_mock,
+            )
+        except Exception as exc:
+            pytest.fail(
+                f"Rule 6 violated: {exception_cls.__name__} "
+                f"propagated to caller instead of being caught by "
+                f"the per-game try/except: {exc!r}"
+            )
+
+        # --- Assert: successful games still processed ------------------
+        marked_game_ids = {
+            key
+            for (domain, key) in checkpoint.marks
+            if domain == config.DOMAIN_GAMES
+        }
+        assert marked_game_ids == {_GAME_IDS[0], _GAME_IDS[2]}, (
+            f"successful games not checkpointed despite "
+            f"{exception_cls.__name__} failure on middle game; "
+            f"marks={checkpoint.marks!r}"
+        )
+        # --- Assert: failing game NOT marked --------------------------
+        assert failing_gid not in marked_game_ids, (
+            f"failing GAME_ID {failing_gid!r} was checkpointed even "
+            f"though {exception_cls.__name__} was raised in the try "
+            f"block; marks={checkpoint.marks!r}"
+        )
+
+        # --- Assert: writer invoked only for successful games ---------
+        # 2 artifacts × 2 successful games = 4 writes (same shape as
+        # the ``test_single_game_failure_continues_iteration`` case).
+        assert len(writer.writes) == 4, (
+            f"expected 4 writes from successful games under "
+            f"{exception_cls.__name__} failure; got {len(writer.writes)}: "
+            f"{[w['name'] for w in writer.writes]!r}"
+        )
+        for w in writer.writes:
+            assert w["season"] == _SEASON
+            assert w["name"] in {config.CSV_GAMES, config.CSV_PLAY_BY_PLAY}
+
+        # --- Assert: games_failed_total carries class-name label ------
+        failed_inc_calls = [
+            c
+            for c in metrics_mock.inc.call_args_list
+            if c.args and c.args[0] == "games_failed_total"
+        ]
+        assert len(failed_inc_calls) == 1, (
+            f"expected exactly 1 games_failed_total inc for "
+            f"{exception_cls.__name__}; got {len(failed_inc_calls)}: "
+            f"{failed_inc_calls!r}"
+        )
+        # Bounded-cardinality contract: label ``reason`` is the
+        # exception CLASS name — NEVER the failing GAME_ID. Exact
+        # equality (not subset) ensures no spurious labels accrete over
+        # time (AAP §0.5.1.6).
+        assert failed_inc_calls[0].args[1] == {
+            "reason": exception_cls.__name__
+        }, (
+            f"games_failed_total label must be "
+            f"{{'reason': {exception_cls.__name__!r}}} "
+            f"(bounded cardinality — AAP §0.5.1.6); "
+            f"got {failed_inc_calls[0].args[1]!r}"
+        )
+        # No ``n=`` kwarg — the default increment of 1 is implicit.
+        assert "n" not in failed_inc_calls[0].kwargs, (
+            f"games_failed_total must be incremented positionally "
+            f"without ``n=`` kwarg; got kwargs="
+            f"{failed_inc_calls[0].kwargs!r}"
+        )
+
+        # --- Assert: exactly one WARNING log with correct format ------
+        warning_calls = logger_mock.warning.call_args_list
+        assert len(warning_calls) == 1, (
+            f"expected exactly 1 WARNING log for "
+            f"{exception_cls.__name__}; got {len(warning_calls)}: "
+            f"{warning_calls!r}"
+        )
+        fmt, *args = warning_calls[0].args
+        assert fmt == "game %s failed: %s", (
+            f"Rule 6 WARNING format string mismatch under "
+            f"{exception_cls.__name__}; expected 'game %%s failed: %%s'; "
+            f"got {fmt!r}"
         )
         assert args[0] == failing_gid, (
             f"WARNING first positional arg must be failing GAME_ID; "
