@@ -25,9 +25,14 @@ Verified behaviours
    buffers), exactly 1 ``checkpoint.mark_completed`` per successful
    game keyed by ``(config.DOMAIN_GAMES, <GAME_ID>)``, and one
    ``pipeline_rows_written_total`` metric increment per write with
-   labels ``{"domain": "games", "file": "games"|"play_by_play"}`` and
-   the ``n=`` keyword carrying the single-game row count (*not* the
-   cumulative row count — each game contributes its own row delta).
+   labels
+   ``{"pipeline": "ingest_games", "artifact": "games.csv"|"play_by_play.csv"}``
+   and the ``n=`` keyword carrying the single-game row count (*not*
+   the cumulative row count — each game contributes its own row
+   delta). The ``pipeline`` and ``artifact`` label names — rather
+   than ``domain``/``file`` — are the documented operator contract
+   (``docs/OBSERVABILITY.md`` §``pipeline_rows_written_total`` and
+   ``docs/dashboards/operator_dashboard.json`` L477).
 
 2. **Idempotency (Rule 5 resume behaviour)** — a checkpoint
    pre-seeded with every game ID short-circuits ``get_pending`` to an
@@ -50,9 +55,13 @@ Verified behaviours
 5. **Rule 6 CANARY — single game failure** — when exactly one of three
    game IDs raises at its first fetch (``boxscoretraditionalv2``), the
    pipeline must: (a) not re-raise, (b) increment
-   ``games_failed_total{game_id=<failing_gid>}`` exactly once, (c)
-   emit a WARNING log with the format string ``"game %s failed: %s"``,
-   (d) *not* call ``checkpoint.mark_completed`` for the failing GID,
+   ``games_failed_total{reason=<ExceptionClassName>}`` exactly once
+   (the ``reason`` label uses ``type(exc).__name__`` per AAP §0.5.1.6
+   to keep cardinality bounded — the failing GID is *not* a label;
+   it is surfaced via the WARNING log line instead), (c) emit a
+   WARNING log with the format string ``"game %s failed: %s"`` and
+   the failing ``<GAME_ID>`` as the first positional argument, (d)
+   *not* call ``checkpoint.mark_completed`` for the failing GID,
    (e) still successfully process and mark the other two games, and
    (f) never accumulate the failed game's rows into either CSV
    buffer.
@@ -61,7 +70,12 @@ Verified behaviours
    raise at ``boxscoretraditionalv2``, the pipeline still completes
    without raising; ``writer.write`` is never called; no game is
    checkpointed; ``games_failed_total`` is incremented three times
-   (once per GID); the final log line reports ``processed=0 failed=3``.
+   (once per GID; all three carry the same ``reason`` label because
+   the injected exception class is shared — this verifies the label
+   collapses to bounded cardinality regardless of how many distinct
+   games fail, and the distinct GIDs are instead surfaced through the
+   WARNING log positional arguments); the final log line reports
+   ``processed=0 failed=3``.
 
 7. **Rule 6 scope — ``enumerate_game_ids`` failure propagates** —
    Rule 6's ``try/except`` is scoped to the *per-game* body only.
@@ -384,9 +398,15 @@ def test_run_happy_path_writes_games_and_marks_each_checkpoint(
     )
 
     # --- Assert: row-written metric increments ------------------------
-    # Expect 6 inc calls to "pipeline_rows_written_total": 3 with file=games
-    # and 3 with file=play_by_play, each carrying the single-game row
-    # count under the ``n=`` kwarg (NOT the cumulative count).
+    # Expect 6 inc calls to "pipeline_rows_written_total": 3 with
+    # artifact="games.csv" and 3 with artifact="play_by_play.csv", each
+    # carrying the single-game row count under the ``n=`` kwarg (NOT the
+    # cumulative count). The ``pipeline`` and ``artifact`` label names —
+    # rather than the older ``domain``/``file`` — are the documented
+    # operator contract (``docs/OBSERVABILITY.md`` and
+    # ``docs/dashboards/operator_dashboard.json`` L477). Artifact values
+    # carry the ``.csv`` suffix to match the CSV filenames operators
+    # actually see on disk.
     row_inc_calls = [
         c
         for c in metrics_mock.inc.call_args_list
@@ -399,20 +419,20 @@ def test_run_happy_path_writes_games_and_marks_each_checkpoint(
     games_inc = [
         c
         for c in row_inc_calls
-        if c.args[1] == {"domain": config.DOMAIN_GAMES, "file": config.CSV_GAMES}
+        if c.args[1] == {"pipeline": "ingest_games", "artifact": f"{config.CSV_GAMES}.csv"}
     ]
     pbp_inc = [
         c
         for c in row_inc_calls
         if c.args[1]
-        == {"domain": config.DOMAIN_GAMES, "file": config.CSV_PLAY_BY_PLAY}
+        == {"pipeline": "ingest_games", "artifact": f"{config.CSV_PLAY_BY_PLAY}.csv"}
     ]
     assert len(games_inc) == 3, (
-        f"expected 3 inc calls with file={config.CSV_GAMES!r}; "
+        f"expected 3 inc calls with artifact={config.CSV_GAMES!r}.csv; "
         f"got {len(games_inc)}"
     )
     assert len(pbp_inc) == 3, (
-        f"expected 3 inc calls with file={config.CSV_PLAY_BY_PLAY!r}; "
+        f"expected 3 inc calls with artifact={config.CSV_PLAY_BY_PLAY!r}.csv; "
         f"got {len(pbp_inc)}"
     )
     # Each row-inc call must carry an ``n`` kwarg (per-game delta,
@@ -683,10 +703,20 @@ class TestRule6FailSafe:
          final log line).
       2. Emit a WARNING log with the format string
          ``"game %s failed: %s"`` carrying the failing GAME_ID and
-         the exception.
+         the exception as positional arguments — this is where the
+         failing GAME_ID is surfaced to operators (it is deliberately
+         NOT a metric label).
       3. Increment ``games_failed_total`` with the positional label
-         dict ``{"game_id": gid}`` (no ``n=`` kwarg — the default
-         increment of 1 applies).
+         dict ``{"reason": type(exc).__name__}`` (no ``n=`` kwarg —
+         the default increment of 1 applies). Per AAP §0.5.1.6 the
+         ``reason`` label takes the exception *class name* (e.g.
+         ``"RuntimeError"``, ``"HTTPError"``) — NEVER the failing
+         GAME_ID — so that cardinality stays bounded by the finite
+         set of exception types the pipeline can raise, regardless
+         of how many distinct games fail over the season. This
+         matches the documented operator contract at
+         ``docs/OBSERVABILITY.md`` §``games_failed_total`` and
+         ``docs/dashboards/operator_dashboard.json`` L236.
       4. ``continue`` — skip to the next GAME_ID without marking the
          checkpoint, without re-raising, and without writing the
          current game's partial buffer contents.
@@ -696,7 +726,14 @@ class TestRule6FailSafe:
       - *Single game failure* — boundary conditions around the
         successful games on either side of the failing one.
       - *Blanket failure* — every game fails; pipeline still
-        completes gracefully with ``processed=0 failed=N``.
+        completes gracefully with ``processed=0 failed=N``. Because
+        all three injected exceptions share a class, the
+        ``games_failed_total`` metric collapses to a single label
+        value (``reason="RuntimeError"``) incremented 3 times — this
+        is precisely the bounded-cardinality property the
+        ``reason``-labelled contract guarantees. The three distinct
+        GAME_IDs are surfaced via the three WARNING log records'
+        positional arguments.
       - *Rule 6 scope* — failures *outside* the per-game body
         (specifically, in ``enumerate_game_ids``) propagate verbatim.
     """
@@ -724,10 +761,17 @@ class TestRule6FailSafe:
             G2 bails before reaching PBP
           - write exactly 4 CSVs (2 per successful game)
           - mark only G1 and G3
-          - increment ``games_failed_total`` exactly once with
-            ``{"game_id": "<G2>"}``
+          - increment ``games_failed_total`` exactly once with the
+            bounded-cardinality label
+            ``{"reason": type(exc).__name__}`` — here
+            ``{"reason": "RuntimeError"}`` because
+            :class:`_SelectiveFailureClient` raises ``RuntimeError``.
+            The failing GAME_ID deliberately does NOT appear in the
+            metric label; it is surfaced in the WARNING log line
+            instead.
           - emit exactly one WARNING log matching ``"game %s failed: %s"``
-            with G2's ID.
+            with G2's ID as the first positional argument (this is
+            where the failing GAME_ID is surfaced to operators).
         """
         # --- Arrange ---------------------------------------------------
         _patch_enumerate(monkeypatch, _GAME_IDS)
@@ -812,13 +856,20 @@ class TestRule6FailSafe:
             f"got {len(failed_inc_calls)}: {failed_inc_calls!r}"
         )
         failed_call = failed_inc_calls[0]
-        # Labels: must be positional, {"game_id": <failing_gid>},
+        # Labels: must be positional, {"reason": type(exc).__name__},
         # with NO ``n=`` kwarg (the default of 1 is implicit — see
         # ingest_games.py line 569: met.inc("games_failed_total",
-        # {"game_id": gid}).
-        assert failed_call.args[1] == {"game_id": failing_gid}, (
+        # {"reason": type(exc).__name__}). Per AAP §0.5.1.6 the
+        # ``reason`` label carries the exception class name — here
+        # "RuntimeError" because :class:`_SelectiveFailureClient`
+        # raises ``RuntimeError``. The failing GAME_ID is deliberately
+        # NOT a label; it is surfaced in the WARNING log line below
+        # (cardinality discipline — keeps the label set bounded by
+        # exception types rather than ballooning with the number of
+        # distinct failing games over a season).
+        assert failed_call.args[1] == {"reason": "RuntimeError"}, (
             f"games_failed_total labels mismatch; "
-            f"expected {{'game_id': {failing_gid!r}}}; "
+            f"expected {{'reason': 'RuntimeError'}}; "
             f"got {failed_call.args[1]!r}"
         )
         assert "n" not in failed_call.kwargs, (
@@ -867,9 +918,21 @@ class TestRule6FailSafe:
           - never call the writer (boxscore fetch fails before any
             write is attempted)
           - never mark any game completed
-          - increment ``games_failed_total`` exactly 3 times (once per
-            GAME_ID) with distinct ``{"game_id": <gid>}`` label dicts
-          - emit exactly 3 WARNING log records
+          - increment ``games_failed_total`` exactly 3 times (once
+            per GAME_ID). All three increments share the *same*
+            label dict ``{"reason": "RuntimeError"}`` because
+            ``raise_for`` injects a single ``RuntimeError`` class
+            for every game — this verifies the bounded-cardinality
+            property of the ``reason`` label: the set of label
+            *values* is the finite set of exception *types*, NOT
+            the unbounded set of failing GAME_IDs. The three
+            distinct failing GAME_IDs are instead surfaced through
+            the three WARNING log records' positional arguments
+            (see the log-record assertion below).
+          - emit exactly 3 WARNING log records whose positional
+            GAME_ID arguments form the full set ``set(_GAME_IDS)``
+            (this is where distinct-GID evidence now lives after
+            the ``game_id``→``reason`` label rename).
           - still emit the final ``pipeline.complete`` log (reached
             because Rule 6 ``continue`` short-circuits each game).
         """
@@ -930,6 +993,16 @@ class TestRule6FailSafe:
         )
 
         # --- Assert: games_failed_total incremented 3× ---------------
+        # Bounded-cardinality property: all three increments carry the
+        # *identical* label dict ``{"reason": "RuntimeError"}`` because
+        # a single ``RuntimeError`` class was injected by ``raise_for``
+        # for all three games. The metric's label set therefore
+        # collapses to a single value regardless of how many distinct
+        # games fail — this is the defining property of the
+        # ``reason``-labelled contract (AAP §0.5.1.6) and protects
+        # the metric from cardinality explosion. Distinct failing
+        # GAME_IDs are verified separately below via the WARNING log
+        # positional arguments.
         failed_inc_calls = [
             c
             for c in metrics_mock.inc.call_args_list
@@ -939,29 +1012,64 @@ class TestRule6FailSafe:
             f"expected 3 games_failed_total inc calls; "
             f"got {len(failed_inc_calls)}: {failed_inc_calls!r}"
         )
-        # Each failing GAME_ID must appear exactly once in the label set.
-        failed_gids = {c.args[1]["game_id"] for c in failed_inc_calls}
-        assert failed_gids == set(_GAME_IDS), (
-            f"failed GAME_IDs mismatch; expected {set(_GAME_IDS)!r}; "
-            f"got {failed_gids!r}"
+        # All three increments must carry the identical label dict.
+        # Since every game raises the same ``RuntimeError`` class, the
+        # set of distinct label dicts collapses to exactly one element.
+        failed_label_dicts = [c.args[1] for c in failed_inc_calls]
+        expected_label = {"reason": "RuntimeError"}
+        assert all(labels == expected_label for labels in failed_label_dicts), (
+            f"every games_failed_total increment must carry the identical "
+            f"label dict {expected_label!r} (bounded-cardinality property "
+            f"of the ``reason`` label); got {failed_label_dicts!r}"
         )
+        # Sanity check: the set of distinct labels collapses to 1.
+        distinct_labels = {tuple(sorted(d.items())) for d in failed_label_dicts}
+        assert len(distinct_labels) == 1, (
+            f"all three increments should collapse to 1 distinct label tuple "
+            f"(single shared exception class); got {len(distinct_labels)}: "
+            f"{distinct_labels!r}"
+        )
+        # No ``n=`` kwarg — default increment of 1 per call.
+        for c in failed_inc_calls:
+            assert "n" not in c.kwargs, (
+                f"games_failed_total must be incremented positionally "
+                f"without ``n=`` kwarg; got kwargs={c.kwargs!r}"
+            )
 
         # --- Assert: 3 WARNING logs with Rule 6 format ---------------
+        # After the ``game_id``→``reason`` label rename, the WARNING
+        # log records are the canonical place distinct failing
+        # GAME_IDs are surfaced to operators. Extract the three
+        # failing GAME_IDs from the positional arguments here — this
+        # is the replacement evidence for the old ``failed_gids``
+        # assertion that read the set from the metric labels.
         warning_calls = logger_mock.warning.call_args_list
         assert len(warning_calls) == 3, (
             f"expected 3 WARNING logs (one per failing game); "
             f"got {len(warning_calls)}"
         )
+        warning_gids = set()
         for call in warning_calls:
             fmt = call.args[0]
             assert fmt == "game %s failed: %s", (
                 f"Rule 6 WARNING format mismatch; got {fmt!r}"
             )
             # First positional arg after format is the GAME_ID.
-            assert call.args[1] in _GAME_IDS, (
+            gid = call.args[1]
+            assert gid in _GAME_IDS, (
                 f"WARNING GAME_ID arg must be one of {_GAME_IDS!r}; "
-                f"got {call.args[1]!r}"
+                f"got {gid!r}"
             )
+            warning_gids.add(gid)
+        # Distinct-GID evidence: all three failing GAME_IDs appear
+        # across the WARNING log records (this is the property the
+        # old metric-label-based ``failed_gids`` assertion checked,
+        # now relocated to the log stream where per-GID context
+        # belongs).
+        assert warning_gids == set(_GAME_IDS), (
+            f"WARNING log GAME_IDs must cover all failing games; "
+            f"expected {set(_GAME_IDS)!r}; got {warning_gids!r}"
+        )
 
     # -----------------------------------------------------------------
     # Rule 6 scope — enumerate_game_ids failure propagates

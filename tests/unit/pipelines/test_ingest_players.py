@@ -65,9 +65,13 @@ Coverage Matrix
     endpoint and retries only the failed one.
 12. **Metrics emission** — each successful write increments
     ``pipeline_rows_written_total`` with labels
-    ``{"domain": "players", "file": <csv_name>}`` and ``n`` equal
-    to the row count of the DataFrame passed to the writer
-    (Observability rule / AAP §0.7.3.1).
+    ``{"pipeline": "ingest_players", "artifact": "<csv_name>.csv"}``
+    and ``n`` equal to the row count of the DataFrame passed to the
+    writer (Observability rule / AAP §0.7.3.1). The ``pipeline`` and
+    ``artifact`` label names are the documented contract in
+    ``docs/OBSERVABILITY.md`` and are consumed by the operator
+    dashboard chart ``pipeline_rows_written_total`` and by the
+    Prometheus exposition ordering.
 13. **Logger defaulting** — when ``run()`` is invoked without an
     explicit ``logger`` argument the module-level fallback
     :data:`_LOGGER` is used; when ``logger`` is supplied, every
@@ -1292,14 +1296,22 @@ class TestMetricsIntegration:
         for name, _, _ in metrics.calls:
             assert name == "pipeline_rows_written_total"
 
-    def test_labels_identify_domain_and_file(
+    def test_labels_identify_pipeline_and_artifact(
         self,
         recording_client,
         recording_writer,
         recording_checkpoint,
     ) -> None:
         """Every ``inc`` call MUST carry labels
-        ``{"domain": "players", "file": <csv_name>}``.
+        ``{"pipeline": "ingest_players", "artifact": "<csv_name>.csv"}``.
+
+        The ``pipeline`` and ``artifact`` label names are the documented
+        operator contract (``docs/OBSERVABILITY.md`` §
+        ``pipeline_rows_written_total`` and
+        ``docs/dashboards/operator_dashboard.json`` L477). The
+        ``artifact`` value MUST include the ``.csv`` suffix so the
+        dashboard legend renders operator-meaningful filenames rather
+        than stems.
         """
         client = recording_client(responses={
             "leaguedashplayerstats": _make_primary_payload(),
@@ -1311,12 +1323,15 @@ class TestMetricsIntegration:
 
         run(client, writer, checkpoint, _SEASON, metrics=metrics)
 
-        files_seen = set()
+        artifacts_seen = set()
         for _, labels, _ in metrics.calls:
-            assert labels["domain"] == config.DOMAIN_PLAYERS
-            assert "file" in labels
-            files_seen.add(labels["file"])
-        assert files_seen == {config.CSV_PLAYERS, config.CSV_PLAYER_TRACKING}
+            assert labels["pipeline"] == "ingest_players"
+            assert "artifact" in labels
+            artifacts_seen.add(labels["artifact"])
+        assert artifacts_seen == {
+            f"{config.CSV_PLAYERS}.csv",
+            f"{config.CSV_PLAYER_TRACKING}.csv",
+        }
 
     def test_n_equals_row_count(
         self,
@@ -1338,12 +1353,12 @@ class TestMetricsIntegration:
 
         run(client, writer, checkpoint, _SEASON, metrics=metrics)
 
-        by_file: Dict[str, float] = {
-            labels["file"]: n
+        by_artifact: Dict[str, float] = {
+            labels["artifact"]: n
             for _, labels, n in metrics.calls
         }
-        assert by_file[config.CSV_PLAYERS] == 5.0
-        assert by_file[config.CSV_PLAYER_TRACKING] == 3.0
+        assert by_artifact[f"{config.CSV_PLAYERS}.csv"] == 5.0
+        assert by_artifact[f"{config.CSV_PLAYER_TRACKING}.csv"] == 3.0
 
     def test_skipped_endpoints_do_not_increment_metric(
         self,
@@ -1369,7 +1384,7 @@ class TestMetricsIntegration:
 
         assert len(metrics.calls) == 1
         _, labels, _ = metrics.calls[0]
-        assert labels["file"] == config.CSV_PLAYER_TRACKING
+        assert labels["artifact"] == f"{config.CSV_PLAYER_TRACKING}.csv"
 
     def test_default_metrics_registry_wired_in(
         self,
@@ -1394,11 +1409,17 @@ class TestMetricsIntegration:
 
         primary_value = registry.get_counter_value(
             "pipeline_rows_written_total",
-            labels={"domain": config.DOMAIN_PLAYERS, "file": config.CSV_PLAYERS},
+            labels={
+                "pipeline": "ingest_players",
+                "artifact": f"{config.CSV_PLAYERS}.csv",
+            },
         )
         tracking_value = registry.get_counter_value(
             "pipeline_rows_written_total",
-            labels={"domain": config.DOMAIN_PLAYERS, "file": config.CSV_PLAYER_TRACKING},
+            labels={
+                "pipeline": "ingest_players",
+                "artifact": f"{config.CSV_PLAYER_TRACKING}.csv",
+            },
         )
         assert primary_value == 2.0
         assert tracking_value == 2.0
@@ -1714,9 +1735,11 @@ class TestEmptyPayload:
 
         run(client, writer, checkpoint, _SEASON, metrics=metrics)
 
-        by_file = {labels["file"]: n for _, labels, n in metrics.calls}
-        assert by_file[config.CSV_PLAYERS] == 0.0
-        assert by_file[config.CSV_PLAYER_TRACKING] == 2.0
+        by_artifact = {
+            labels["artifact"]: n for _, labels, n in metrics.calls
+        }
+        assert by_artifact[f"{config.CSV_PLAYERS}.csv"] == 0.0
+        assert by_artifact[f"{config.CSV_PLAYER_TRACKING}.csv"] == 2.0
 
 
 # ---------------------------------------------------------------------------

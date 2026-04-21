@@ -210,11 +210,21 @@ def cli(ctx: click.Context) -> None:
 #      and season.
 #   3. Invoke the pipeline's run() with keyword arguments
 #      client/writer/checkpoint/season.
-#   4. On success: increment pipeline_runs_total{status=success} and
+#   4. On success: increment
+#      pipeline_runs_total{pipeline=ingest_<domain>,outcome=success} and
 #      emit "run.complete" INFO.
-#   5. On failure: increment pipeline_runs_total{status=failure}, emit
-#      "run.failed" ERROR with exception info, and re-raise so Click
-#      exits with a non-zero status.
+#   5. On failure: increment
+#      pipeline_runs_total{pipeline=ingest_<domain>,outcome=error},
+#      emit "run.failed" ERROR with exception info, and re-raise so
+#      Click exits with a non-zero status.
+#
+# The ``pipeline`` / ``outcome`` labels with values ``ingest_<domain>`` /
+# ``success|error`` are the binding contract documented in
+# ``docs/OBSERVABILITY.md`` (metrics catalog) and queried by the
+# ``operator_dashboard`` (``sum by (outcome) (...)`` chart and the
+# ``PipelineErrorOutcome`` alert rule). The ``all`` aggregate subcommand
+# uses ``pipeline="all"`` as a special marker distinguishing
+# whole-run outcomes from per-pipeline outcomes.
 #
 # The try/except Exception boundary here is *explicitly sanctioned* by
 # AAP §0.5.2.1: it logs-and-reraises, never silently swallows. This is
@@ -243,13 +253,13 @@ def players(season: str) -> None:
         )
         metrics.registry.inc(
             "pipeline_runs_total",
-            {"domain": "players", "status": "success"},
+            {"pipeline": "ingest_players", "outcome": "success"},
         )
         log.info("run.complete subcommand=players season=%s", season)
     except Exception:
         metrics.registry.inc(
             "pipeline_runs_total",
-            {"domain": "players", "status": "failure"},
+            {"pipeline": "ingest_players", "outcome": "error"},
         )
         log.exception("run.failed subcommand=players season=%s", season)
         raise
@@ -275,13 +285,13 @@ def teams(season: str) -> None:
         )
         metrics.registry.inc(
             "pipeline_runs_total",
-            {"domain": "teams", "status": "success"},
+            {"pipeline": "ingest_teams", "outcome": "success"},
         )
         log.info("run.complete subcommand=teams season=%s", season)
     except Exception:
         metrics.registry.inc(
             "pipeline_runs_total",
-            {"domain": "teams", "status": "failure"},
+            {"pipeline": "ingest_teams", "outcome": "error"},
         )
         log.exception("run.failed subcommand=teams season=%s", season)
         raise
@@ -316,13 +326,13 @@ def games(season: str) -> None:
         )
         metrics.registry.inc(
             "pipeline_runs_total",
-            {"domain": "games", "status": "success"},
+            {"pipeline": "ingest_games", "outcome": "success"},
         )
         log.info("run.complete subcommand=games season=%s", season)
     except Exception:
         metrics.registry.inc(
             "pipeline_runs_total",
-            {"domain": "games", "status": "failure"},
+            {"pipeline": "ingest_games", "outcome": "error"},
         )
         log.exception("run.failed subcommand=games season=%s", season)
         raise
@@ -348,13 +358,13 @@ def lineups(season: str) -> None:
         )
         metrics.registry.inc(
             "pipeline_runs_total",
-            {"domain": "lineups", "status": "success"},
+            {"pipeline": "ingest_lineups", "outcome": "success"},
         )
         log.info("run.complete subcommand=lineups season=%s", season)
     except Exception:
         metrics.registry.inc(
             "pipeline_runs_total",
-            {"domain": "lineups", "status": "failure"},
+            {"pipeline": "ingest_lineups", "outcome": "error"},
         )
         log.exception("run.failed subcommand=lineups season=%s", season)
         raise
@@ -380,13 +390,13 @@ def schedule(season: str) -> None:
         )
         metrics.registry.inc(
             "pipeline_runs_total",
-            {"domain": "schedule", "status": "success"},
+            {"pipeline": "ingest_schedule", "outcome": "success"},
         )
         log.info("run.complete subcommand=schedule season=%s", season)
     except Exception:
         metrics.registry.inc(
             "pipeline_runs_total",
-            {"domain": "schedule", "status": "failure"},
+            {"pipeline": "ingest_schedule", "outcome": "error"},
         )
         log.exception("run.failed subcommand=schedule season=%s", season)
         raise
@@ -442,13 +452,13 @@ def all_cmd(season: str) -> None:
             log.info("pipeline.complete name=%s", name)
         metrics.registry.inc(
             "pipeline_runs_total",
-            {"domain": "all", "status": "success"},
+            {"pipeline": "all", "outcome": "success"},
         )
         log.info("run.complete subcommand=all season=%s", season)
     except Exception:
         metrics.registry.inc(
             "pipeline_runs_total",
-            {"domain": "all", "status": "failure"},
+            {"pipeline": "all", "outcome": "error"},
         )
         log.exception("run.failed subcommand=all season=%s", season)
         raise

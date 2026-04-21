@@ -346,7 +346,7 @@ def run(
     path = writer.write(df, csv_name, season)
     met.inc(
         "pipeline_rows_written_total",
-        {"domain": domain, "file": csv_name},
+        {"pipeline": "ingest_teams", "artifact": f"{csv_name}.csv"},
         n=len(df),
     )
     log.info(

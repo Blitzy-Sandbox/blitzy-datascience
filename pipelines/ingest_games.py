@@ -132,14 +132,21 @@ All log calls use ``%s``-style placeholders (not f-strings) so the
 
 Counters incremented (pre-registered by :mod:`utils.metrics`):
 
-* ``pipeline_rows_written_total{domain="games", file="games"}`` —
-  incremented by ``len(bs_df)`` on every successful per-game write.
-* ``pipeline_rows_written_total{domain="games", file="play_by_play"}`` —
-  incremented by ``len(pbp_df)`` on every successful per-game write.
-* ``games_failed_total{game_id=<GID>}`` — incremented inside the
-  Rule 6 ``except`` block. This counter's name is a **verbatim
-  binding invariant** per AAP §0.5.1.6 — it appears exactly once
-  in the production codebase and is incremented nowhere else.
+* ``pipeline_rows_written_total{pipeline="ingest_games", artifact="games.csv"}``
+  — incremented by ``len(bs_df)`` on every successful per-game write.
+* ``pipeline_rows_written_total{pipeline="ingest_games", artifact="play_by_play.csv"}``
+  — incremented by ``len(pbp_df)`` on every successful per-game write.
+* ``games_failed_total{reason=<ExceptionClassName>}`` — incremented
+  inside the Rule 6 ``except`` block. The ``reason`` label captures
+  ``type(exc).__name__`` so dashboards can filter failures by
+  exception class (e.g. ``"RuntimeError"``, ``"Timeout"``, or
+  ``"HTTPError"``) and ``sum(increase(games_failed_total[24h]))``
+  yields a bounded-cardinality aggregate (not one series per
+  GAME_ID). This counter's name is a **verbatim binding
+  invariant** per AAP §0.5.1.6 — it appears exactly once in the
+  production codebase and is incremented nowhere else. The label
+  shape is aligned with ``docs/OBSERVABILITY.md`` L179/L224 and
+  ``docs/dashboards/operator_dashboard.json`` L236.
 
 Authoritative references
 ------------------------
@@ -529,12 +536,12 @@ def run(
             # ---- Per-artifact row counters (Observability rule) ----
             met.inc(
                 "pipeline_rows_written_total",
-                {"domain": domain, "file": config.CSV_GAMES},
+                {"pipeline": "ingest_games", "artifact": f"{config.CSV_GAMES}.csv"},
                 n=len(bs_df),
             )
             met.inc(
                 "pipeline_rows_written_total",
-                {"domain": domain, "file": config.CSV_PLAY_BY_PLAY},
+                {"pipeline": "ingest_games", "artifact": f"{config.CSV_PLAY_BY_PLAY}.csv"},
                 n=len(pbp_df),
             )
 
@@ -564,9 +571,19 @@ def run(
             # invariant). The ``continue`` keyword is mandatory —
             # without it the remaining in-loop iteration would
             # advance without explicit intent.
+            #
+            # The ``reason`` label captures the exception class name
+            # (AAP §0.5.1.6: "reason=type(e).__name__"). Using the
+            # class name — not the failing ``GAME_ID`` — keeps the
+            # metric's label cardinality bounded (Prometheus best
+            # practice) and makes dashboard aggregations like
+            # ``sum(increase(games_failed_total[24h]))`` meaningful.
+            # The failing ``GAME_ID`` remains visible in the WARNING
+            # log record above (``"game %s failed: %s"``) for
+            # operator forensics.
             failed += 1
             log.warning("game %s failed: %s", gid, exc)
-            met.inc("games_failed_total", {"game_id": gid})
+            met.inc("games_failed_total", {"reason": type(exc).__name__})
             continue
 
     log.info(
