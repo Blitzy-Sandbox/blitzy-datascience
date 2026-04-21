@@ -192,6 +192,30 @@ class TestFetchLeaguedashteamstats:
 
         assert result is response
 
+    def test_returns_raw_payload_from_shared_fixture(
+        self, recording_client, sample_single_table_payload
+    ) -> None:
+        """The wrapper returns the canonical ``resultSets`` envelope unchanged.
+
+        Uses the shared ``sample_single_table_payload`` fixture from
+        :mod:`tests.conftest` — the same envelope shape the schema
+        normalizer accepts — to guarantee the wrapper performs zero
+        mutation between ``client.get`` and the caller. This is a
+        passthrough contract: if the wrapper ever starts re-shaping or
+        filtering the response, this assertion will fail loudly.
+        """
+        client = recording_client(
+            responses={"leaguedashteamstats": sample_single_table_payload}
+        )
+        result = teams.fetch_leaguedashteamstats(client=client, season="2025-26")
+
+        # Identity equality proves zero mutation — the same dict object
+        # flows from ``client.get`` through the wrapper to the caller.
+        assert result is sample_single_table_payload
+        # Structural equality is a strictly weaker assertion but also
+        # holds and documents the expected envelope shape.
+        assert result == sample_single_table_payload
+
     def test_explicit_season_type_and_league_id_win(self, recording_client) -> None:
         """Explicit args override the config defaults."""
         client = recording_client()
