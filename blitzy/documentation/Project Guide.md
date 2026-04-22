@@ -64,7 +64,7 @@ pie showData
 ### 1.6 Recommended Next Steps
 
 1. **[High]** Run `python run.py all --season 2025-26` in a residential / allowlisted-egress environment to live-verify Validation Gate 1 and Gate 8. Expected outcome: seven non-empty flat CSVs in `output/` plus populated `output/checkpoint.json`.
-2. **[High]** Perform human code review with focus on the two integration test files (`tests/integration/test_gate1_all_live.py`, `tests/integration/test_gate8_games_resume.py`) modified in the latest commit, plus end-to-end trace of the Rule 6 fail-safe iteration block in `pipelines/ingest_games.py`.
+2. **[High]** Perform human code review with focus on the two integration test files (`tests/integration/test_gate1_all_live.py`, `tests/integration/test_gate8_games_resume.py`) modified in the latest commit, plus end-to-end trace of the Rule 6 fail-safe iteration block in `pipelines/ingest_games.py`. Prior to human sign-off, consult the eight-phase sequential pre-approval audit trail in `CODE_REVIEW.md` (final verdict: `APPROVED_FOR_PR`); see §11 of this guide for a domain-by-domain summary.
 3. **[High]** Deploy to target operator workstation or headless server; run `python run.py health && python run.py ready` to confirm runtime environment is correctly provisioned.
 4. **[Medium]** Integrate `docs/dashboards/operator_dashboard.json` with a Grafana instance and wire the on-demand metrics exposition into a recurring scrape (or convert to a persistent HTTP `/metrics` endpoint if later operational requirements demand it; see D-005 for context).
 5. **[Medium]** Author operator runbook documenting alert responses, checkpoint corruption recovery (`output/checkpoint.json` manual edit), and restart procedures after WAF-triggered failures.
@@ -528,6 +528,9 @@ ls output/
 | `docs/features/*.md` | 5 per-domain deep-dives |
 | `docs/dashboards/operator_dashboard.{json,md}` | Grafana + Markdown dashboards |
 | `docs/executive-summary.html` | Self-contained reveal.js deck |
+| `CODE_REVIEW.md` | Repository-root pre-approval review artifact; 8-phase audit trail; final verdict `APPROVED_FOR_PR` (see §11) |
+| `PROJECT_GUIDE.md` | Repository-root entry-point index linking this Project Guide to `CODE_REVIEW.md` (see §11) |
+| `blitzy/documentation/Project Guide.md` | This comprehensive Blitzy Project Guide (what you are reading) |
 | `output/` (runtime) | 7 CSVs + checkpoint.json |
 | `logs/pipeline.log` (runtime) | Rotating file log (10 MB cap default) |
 
@@ -608,6 +611,73 @@ The pipeline reads all runtime configuration from `config.py` module-level const
 | **Click** | CLI framework backing `run.py` (D-007, F-001) |
 | **WAF** | Web Application Firewall — specifically Akamai WAF fronting `stats.nba.com` that drops datacenter-origin HTTPS requests |
 | **Blitzy Agent** | Autonomous implementation agent identified by `agent@blitzy.com`; 92 of 94 commits on this branch |
+| **CODE_REVIEW.md** | Repository-root artifact capturing the mandatory eight-phase sequential pre-approval review pipeline per the Refine PR instructions; see Section 11 for details |
+| **PROJECT_GUIDE.md** | Repository-root entry-point pointing to this comprehensive Project Guide and to `CODE_REVIEW.md`; created to satisfy the Refine PR instruction "Reference the finalized CODE_REVIEW.md in the PROJECT_GUIDE.md file" |
+
+---
+
+## 11. Code Review Pipeline
+
+### 11.1 Overview
+
+Per the Refine PR instructions, no Pull Request may be opened until a six-or-more-phase sequential pre-approval review is complete. This project's review pipeline is recorded in a dedicated repository-root artifact: **`CODE_REVIEW.md`**. That document is the authoritative record for this branch's code review and must be consulted alongside this Project Guide before any merge decision.
+
+### 11.2 Artifact Location and Structure
+
+| Item | Value |
+|------|-------|
+| **File path** | `CODE_REVIEW.md` (repository root) |
+| **Companion entry point** | `PROJECT_GUIDE.md` (repository root) — a concise cross-reference index that links this full Project Guide and `CODE_REVIEW.md` together |
+| **Frontmatter format** | YAML; tracks branch, review type, review start date, each phase's domain, agent persona, status, and a `final_verdict` field |
+| **Per-phase status vocabulary** | `OPEN`, `IN_REVIEW`, `BLOCKED`, `APPROVED` |
+| **Final verdict vocabulary** | `APPROVED_FOR_PR`, `BLOCKED` (with remediation steps documented in-line) |
+| **Scope** | All 101 tracked files on branch `blitzy-2097d974-6293-4db1-98fa-a61aeaf2f179`, each assigned to exactly one review domain |
+
+### 11.3 Eight-Phase Sequential Review
+
+The review is decomposed into seven domain phases plus a final Principal Reviewer consolidation phase. Each phase is executed sequentially by a designated Expert Agent; the explicit handoff between phases is documented in `CODE_REVIEW.md`.
+
+| # | Phase | Expert Agent Persona | Files Reviewed | Status |
+|---|-------|---------------------|-----------------|--------|
+| 1 | Infrastructure / DevOps | Infrastructure/DevOps Expert Agent | `requirements.txt`, `pytest.ini`, `.flake8`, `.gitignore`, `.env.example`, `README.md`, `docs/ONBOARDING.md` (7 files) | APPROVED |
+| 2 | Security | Security Expert Agent | `api/nba_client.py`, `config.py`, `utils/correlation.py`, `utils/logger.py`, `utils/rate_limiter.py`, `tests/invariants/test_rule1_sole_http_client.py` (6 files) | APPROVED |
+| 3 | Backend Architecture | Backend Architecture Expert Agent | 26 touchpoints across 21 unique production files (pipelines, endpoints, storage, CLI, remaining utils, remaining invariants) | APPROVED |
+| 4 | QA / Test Integrity | QA/Test Integrity Expert Agent | 30 test files spanning `tests/unit/`, `tests/integration/`, and remaining `tests/invariants/` | APPROVED |
+| 5 | Business / Domain | Business/Domain Expert Agent | 11 files — the 5 `endpoints/*.py` wrappers plus the 5 `docs/features/*.md` per-domain deep-dives plus `docs/api/endpoints_catalog.md` | APPROVED |
+| 6 | Frontend | Frontend Expert Agent | `docs/executive-summary.html` (1 file — the single-file reveal.js deck) | APPROVED |
+| 7 | Other SME (Documentation / Observability) | Documentation & Observability Expert Agent | 20 files — `docs/OBSERVABILITY.md`, `docs/DECISIONS.md`, `docs/TRACEABILITY.md`, dashboards, runtime/log docs, plus the `blitzy/documentation/` artifacts themselves | APPROVED |
+| 8 | Principal Reviewer | Principal Reviewer Agent | Consolidation and final verdict across all prior phases | **APPROVED_FOR_PR** |
+
+### 11.4 Principal Reviewer Verdict
+
+The Principal Reviewer Agent rendered the final verdict **APPROVED_FOR_PR** after verifying that:
+
+- All seven domain phases reached the terminal status `APPROVED` with zero blockers.
+- Every changed file is assigned to exactly one review domain (no duplicates, no orphans).
+- Each phase's handoff to the next domain is explicitly documented in `CODE_REVIEW.md`.
+- The implemented code is aligned with the Agent Action Plan §§0.1–0.8 (features F-001 through F-013; operational Rules 1–8; validation Gates 1, 2, 8, 9, 10, 12, 13).
+- No AAP in-scope item is unimplemented, and no AAP out-of-scope item is introduced.
+- The invariant tests (Rules 1, 4, 7) pass; unit tests pass 698/698; integration tests (Gates 1, 8) are correctly deferred with documented WAF mitigation.
+
+The full gap analysis — feature-by-feature, rule-by-rule, gate-by-gate — is recorded in `CODE_REVIEW.md` §8 (Principal Reviewer Phase).
+
+### 11.5 Gate Status at Time of Review
+
+| Gate | Description | Status in `CODE_REVIEW.md` |
+|------|-------------|----------------------------|
+| Gate 1 | `python run.py all --season 2025-26` produces non-empty CSVs | DEFERRED — WAF-blocked env; implementation complete, test scaffolding in place, manual verification required in allowlisted environment |
+| Gate 2 | Zero-warning build + clean lint | PASSED (py_compile exit 0; flake8 exit 0) |
+| Gate 8 | Games resume determinism + zero 429s | DEFERRED — WAF-blocked env (same mitigation as Gate 1) |
+| Gate 9 | Every pipeline reachable from `run.py` | PASSED |
+| Gate 10 | `pytest tests/` exit 0 | PASSED (698 passed, 2 integration deselected) |
+| Gate 12 | Config propagation traceability | PASSED |
+| Gate 13 | Every CLI subcommand dispatches to its pipeline | PASSED |
+
+### 11.6 How to Use `CODE_REVIEW.md` Alongside This Project Guide
+
+1. **For PR reviewers:** read `CODE_REVIEW.md` first to understand the pre-approval audit trail, then cross-reference this Project Guide §1 (Executive Summary), §3 (Test Results), and §5 (Compliance & Quality Review) for the underlying engineering evidence.
+2. **For future agents working on new commits:** the eight-phase review must be re-executed if any file's contents change materially. Update `CODE_REVIEW.md`'s frontmatter `review_start_date` and re-run each relevant phase. Keep this Project Guide §11 synchronized with any such re-execution.
+3. **For release engineers:** the Principal Reviewer's `APPROVED_FOR_PR` verdict, together with the Gate 1 / Gate 8 deferral rationale in §1.4 above, forms the merge-readiness check; no additional sign-off step is prescribed.
 
 ---
 
