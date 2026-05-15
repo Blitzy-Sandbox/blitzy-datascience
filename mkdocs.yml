@@ -1,0 +1,21 @@
+site_name: blitzy-datascience
+site_description: >-
+  A modular Python pipeline for ingesting, normalizing, and persisting NBA
+  statistics data from the NBA Stats API.
+
+docs_dir: docs
+
+plugins:
+  - techdocs-core
+
+markdown_extensions:
+  - admonition
+  - toc:
+      permalink: true
+  - pymdownx.superfences
+  - pymdownx.details
+
+nav:
+  - Overview: index.md
+  - Product Prompts:
+      - New Product Prompt (2026-04-18): New_Product_Prompt_20260418.md
