@@ -6,6 +6,7 @@ metadata:
     NBA Stats API
   tags:
   - data-pipeline
+  - new-feature
   - python
   annotations:
     github.com/project-slug: Blitzy-Sandbox/blitzy-datascience
