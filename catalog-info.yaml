@@ -4,7 +4,8 @@ metadata:
   name: blitzy-datascience
   description: Modular Python pipeline for ingesting NBA statistics data from the
     NBA Stats API
-  tags: []
+  tags:
+  - data-pipeline
   annotations:
     github.com/project-slug: Blitzy-Sandbox/blitzy-datascience
     backstage.io/source-location: url:https://github.com/Blitzy-Sandbox/blitzy-datascience/tree/main/
