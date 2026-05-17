@@ -20,6 +20,8 @@
     <li><a href="#about-the-project">About The Project</a></li>
     <li><a href="#built-with">Built With</a></li>
     <li><a href="#getting-started">Getting Started</a></li>
+    <li><a href="#observability">Observability</a></li>
+    <li><a href="#documentation">Documentation</a></li>
     <li><a href="#usage">Usage</a></li>
     <li><a href="#structure">Structure</a></li>
     <li><a href="#data-domains">Data Domains</a></li>
@@ -51,16 +53,73 @@ Designed for composability: each layer (HTTP client, endpoints, pipelines, stora
 
 ### Prerequisites
 
-- Python 3.11+
-- pip
+- Python 3.11+ and pip (verified against Python 3.11 and 3.12)
 
 ### Installation
 
 ```bash
 git clone https://github.com/Blitzy-Sandbox/blitzy-datascience.git
 cd blitzy-datascience
+python3 -m venv .venv && source .venv/bin/activate
+pip install --upgrade pip
 pip install -r requirements.txt
 ```
+
+### First run
+
+```bash
+python run.py --help
+python run.py all --season 2025-26
+```
+
+### Development setup
+
+```bash
+pip install -r requirements.txt                # includes pytest + flake8 pins
+python -m pytest tests/ -m "not integration"   # unit + invariant tests only
+python -m pytest tests/                        # full suite including @pytest.mark.integration
+python -m flake8 .                             # lint gate (Gate 2)
+python -m py_compile $(git ls-files '*.py')    # zero-warning compile gate
+```
+
+For a deeper clean-machine guide, including domain context, common pitfalls, and extension patterns, see [docs/ONBOARDING.md](docs/ONBOARDING.md).
+
+## Observability
+
+Every run emits structured logs to stdout and a rotating file at `logs/pipeline.log`. Each log record carries a UUID4 correlation ID minted at CLI entry, so a single invocation is traceable end-to-end across every module. Diagnostic subcommands expose health and metrics on demand.
+
+```bash
+python run.py health      # liveness: always-on
+python run.py ready       # readiness: output/ writable, config valid, checkpoint parseable
+python run.py metrics     # Prometheus text-format counters for requests, retries, rows, failures
+```
+
+See [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md) for the full log format, the metrics catalog, the dashboard template, and correlation-ID propagation details.
+
+Exposed counters: `nba_requests_total`, `nba_request_failures_total`, `nba_retries_total`, `pipeline_rows_written_total`, `pipeline_runs_total`, `games_failed_total`.
+
+## Troubleshooting
+
+The NBA Stats API at `stats.nba.com/stats/*` is fronted by **Akamai**, which enforces bot- and geo-based access controls. Requests from **non-US geographies**, **cloud-provider IP ranges** (AWS, GCP, Azure, etc.), **datacenter ASNs**, or common **VPN exit nodes** are typically dropped silently (`ReadTimeout`) or rejected with `HTTP 403`. If `python run.py ready` reports `"status": "not_ready"` or the pipeline logs `ReadTimeout` / `403` errors, the upstream is unreachable from your current network — this is **environmental, not a code defect**. Run from a US residential IP or tunnel through a residential exit. See [docs/ONBOARDING.md#pitfall-9-nba-stats-api-returns-http-403-or-silently-times-out-on-stats-akamai-geobot-block](docs/ONBOARDING.md) Pitfall 9 for full diagnostics and fixes.
+
+## Documentation
+
+| Document | Purpose |
+|---|---|
+| [docs/ONBOARDING.md](docs/ONBOARDING.md) | Setup, domain context, pitfalls, extension patterns, next tasks. |
+| [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md) | Log format, correlation IDs, metrics catalog, health/readiness, dashboards. |
+| [docs/DECISIONS.md](docs/DECISIONS.md) | Decision log (Decision / Alternatives / Rationale / Risk). |
+| [docs/TRACEABILITY.md](docs/TRACEABILITY.md) | Bidirectional matrix: features ↔ rules ↔ gates ↔ files. |
+| [docs/api/endpoints_catalog.md](docs/api/endpoints_catalog.md) | Per-endpoint reference for all 15+ NBA Stats endpoints. |
+| [docs/features/players.md](docs/features/players.md) | F-009 Players pipeline deep dive. |
+| [docs/features/teams.md](docs/features/teams.md) | F-010 Teams pipeline deep dive. |
+| [docs/features/games.md](docs/features/games.md) | F-011 Games pipeline deep dive (Rule 6 narrative). |
+| [docs/features/lineups.md](docs/features/lineups.md) | F-012 Lineups pipeline deep dive. |
+| [docs/features/schedule.md](docs/features/schedule.md) | F-013 Schedule pipeline deep dive (F-011 dependency). |
+| [docs/dashboards/operator_dashboard.json](docs/dashboards/operator_dashboard.json) | Grafana-compatible dashboard template. |
+| [docs/dashboards/operator_dashboard.md](docs/dashboards/operator_dashboard.md) | Markdown operator dashboard fallback. |
+| [docs/executive-summary.html](docs/executive-summary.html) | Self-contained reveal.js executive deck (Blitzy brand). |
+| [docs/New_Product_Prompt_20260418.md](docs/New_Product_Prompt_20260418.md) | Authoritative product brief (read-only). |
 
 ## Usage
 
@@ -88,30 +147,50 @@ Re-run the same command. The checkpoint manifest (`output/checkpoint.json`) trac
 
 ```
 blitzy-datascience/
-├── run.py                     # CLI entry point (click subcommands)
-├── config.py                  # Season list, output paths, API base URL
-├── requirements.txt
+├── run.py                     # CLI entry point (click subcommands + health/ready/metrics)
+├── config.py                  # Season list, output paths, API base URL, retry params, headers
+├── requirements.txt           # Pinned runtime + dev dependencies
+├── pytest.ini                 # pytest markers and warning filters (Gate 10)
+├── .flake8                    # Lint configuration (Gate 2)
+├── .gitignore                 # Excludes output/, logs/, __pycache__/, .pytest_cache/, venv
+├── .env.example               # Operator-overridable env vars reference
 ├── api/
+│   ├── __init__.py
 │   └── nba_client.py          # HTTP client: headers, retries, rate limiting
 ├── endpoints/
-│   ├── players.py             # Player stats endpoints
-│   ├── teams.py               # Team stats endpoints
-│   ├── games.py               # Box scores, play-by-play endpoints
-│   ├── lineups.py             # Lineup stats endpoints
-│   └── schedule.py            # Season schedule endpoint
+│   ├── __init__.py
+│   ├── players.py             # 5 Players endpoints
+│   ├── teams.py               # 3 Teams endpoints
+│   ├── games.py               # 4 Games endpoints (box scores + PBP)
+│   ├── lineups.py             # 2 Lineups endpoints (incl. on/off splits)
+│   └── schedule.py            # leaguegamefinder + enumerate_game_ids helper
 ├── pipelines/
-│   ├── ingest_players.py      # Player data orchestration
-│   ├── ingest_teams.py        # Team data orchestration
-│   └── ingest_games.py        # Game-level iteration and ingestion
+│   ├── __init__.py
+│   ├── ingest_players.py      # F-009 orchestrator
+│   ├── ingest_teams.py        # F-010 orchestrator
+│   ├── ingest_games.py        # F-011 orchestrator (Rule 6 fail-safe iteration)
+│   ├── ingest_lineups.py      # F-012 orchestrator
+│   └── ingest_schedule.py     # F-013 orchestrator + GAME_ID enumeration
 ├── storage/
-│   └── csv_writer.py          # CSV writer (pluggable interface)
+│   ├── __init__.py
+│   └── csv_writer.py          # BaseWriter ABC + CSVWriter (sole to_csv caller)
 ├── utils/
-│   ├── rate_limiter.py        # Exponential backoff + jitter
-│   ├── schema_normalizer.py   # Flatten nested JSON, enforce types
-│   ├── checkpoint.py          # JSON manifest for resumability
-│   └── logger.py              # Logging configuration
-└── output/                    # Generated CSV files
-    └── checkpoint.json        # Pull completion manifest
+│   ├── __init__.py
+│   ├── rate_limiter.py        # ≥ 1.0s floor (Rule 2)
+│   ├── schema_normalizer.py   # Flatten resultSets (Rule 4)
+│   ├── checkpoint.py          # JSON manifest (Rule 5)
+│   ├── logger.py              # Stdlib logging + rotating file + correlation ID
+│   ├── correlation.py         # contextvars-based correlation ID propagation
+│   ├── metrics.py             # Prometheus text-format counter registry
+│   └── health.py              # Health and readiness probes
+├── tests/
+│   ├── conftest.py
+│   ├── unit/                  # mirrors production tree
+│   ├── integration/           # @pytest.mark.integration live tests (Gates 1, 8)
+│   └── invariants/            # grep/DataFrame invariants (Rules 1, 4, 7)
+├── docs/                      # Product brief + onboarding, observability, decisions, traceability, dashboards, executive deck, per-feature docs
+└── output/                    # Runtime artifacts (excluded from VCS)
+    └── checkpoint.json
 ```
 
 ## Data Domains
@@ -120,6 +199,7 @@ blitzy-datascience/
 | Endpoint | Description |
 |----------|-------------|
 | `leaguedashplayerstats` | Per game, totals, and advanced player stats |
+| `leaguedashplayerclutch` | Clutch splits per player |
 | `playercareerstats` | Career totals per player |
 | `playergamelog` | Game-level player logs |
 | `leaguedashptstats` | Player tracking stats |
@@ -143,6 +223,7 @@ blitzy-datascience/
 | Endpoint | Description |
 |----------|-------------|
 | `leaguedashlineups` | Lineup combination stats |
+| `leaguedashplayerclutch` | On/off split lineup clutch data |
 
 ### Schedule
 | Endpoint | Description |
@@ -187,11 +268,20 @@ CLI (run.py)
 
 ## Tasks
 
-- [ ] Implement core pipeline modules
-- [ ] Add integration tests with live API smoke tests
-- [ ] Add database writer implementation (PostgreSQL / DuckDB)
-- [ ] Add parallel game-level ingestion with thread pool
-- [ ] Add scheduling support for incremental daily updates
+### Completed in this release
+- [x] Core pipeline modules implemented (config, api, endpoints, pipelines, storage, utils)
+- [x] CLI entry point with players / teams / games / lineups / schedule / all subcommands
+- [x] Diagnostic subcommands: health, ready, metrics
+- [x] Unit, integration, and invariant test suite (`python -m pytest tests/`)
+- [x] Structured logging with correlation IDs and rotating file sink
+- [x] Decision log and bidirectional traceability matrix
+- [x] Executive summary deck (reveal.js)
+
+### Deferred to future phases
+- [ ] Database writer implementation (PostgreSQL / DuckDB) — `BaseWriter` extension point preserved
+- [ ] Parallel game-level ingestion with thread pool (requires revisiting Rule 2 floor)
+- [ ] Scheduling support for incremental daily updates
+- [ ] Remote metrics backend (Prometheus scraping / Pushgateway)
 
 ## Contributing
 
@@ -214,6 +304,8 @@ Project Link: [https://github.com/Blitzy-Sandbox/blitzy-datascience](https://git
 - [NBA Stats API](https://stats.nba.com)
 - [pandas](https://pandas.pydata.org)
 - [click](https://click.palletsprojects.com)
+- [requests](https://docs.python-requests.org)
+- [tenacity](https://tenacity.readthedocs.io)
 
 ---
 

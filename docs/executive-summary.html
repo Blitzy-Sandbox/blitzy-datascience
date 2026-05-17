@@ -1,0 +1,876 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+  <title>NBA Data Ingestion Pipeline — Executive Summary</title>
+
+  <!-- Fonts (Google Fonts) -->
+  <!-- NOTE on SRI: the Google Fonts stylesheet (fonts.googleapis.com/css2?...) is
+       dynamically generated per-request (user-agent-sensitive CSS that points at the
+       appropriate woff2 files in fonts.gstatic.com). A fixed SHA-384 integrity hash
+       is therefore not feasible for this stylesheet. `crossorigin` is set on the
+       preconnect to fonts.gstatic.com so the font binaries themselves are fetched
+       over a CORS-enabled connection. The three pinned CDN assets below (reveal.js
+       core + white theme + reveal.js JS + Mermaid + Lucide) DO carry SHA-384 SRI
+       hashes in their integrity attributes, per the m-4 remediation recorded in
+       docs/DECISIONS.md. -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&family=Fira+Code:wght@400;500&display=swap" crossorigin="anonymous">
+
+  <!-- reveal.js 5.1.0 core + white base theme (overridden by inline Blitzy theme below) -->
+  <link rel="stylesheet"
+        href="https://cdnjs.cloudflare.com/ajax/libs/reveal.js/5.1.0/reveal.min.css"
+        integrity="sha384-1RYZY7bWr47av1F0MzHgCbqOI7hIwg9dvdmXpRYIaK1mf1sxSE8pReydle4L0NAK"
+        crossorigin="anonymous">
+  <link rel="stylesheet"
+        href="https://cdnjs.cloudflare.com/ajax/libs/reveal.js/5.1.0/theme/white.min.css"
+        integrity="sha384-8UhmY3T2olG6oZIfOyb1oUGwYshcwnIUeerEsJfMXfZq7EGWLTMIm1ESdsinvXig"
+        crossorigin="anonymous"
+        id="theme">
+
+  <!-- Blitzy brand theme (inline, authoritative) -->
+  <style>
+    /* ------------------------------------------------------------------ */
+    /* Blitzy brand CSS custom properties (single source of truth)         */
+    /* ------------------------------------------------------------------ */
+    :root {
+      /* Primary palette */
+      --blitzy-primary: #0B1F3A;         /* deep navy: headers, dividers, primary text */
+      --blitzy-accent:  #00C2A8;         /* teal: KPI highlights, progress bars, links */
+      --blitzy-warning: #F5B700;         /* amber: risk callouts */
+      --blitzy-danger:  #E63946;         /* red: critical risks */
+      --blitzy-success: #2DC653;         /* green: gates passed */
+
+      /* Neutrals */
+      --blitzy-bg:        #FFFFFF;       /* slide background (light mode) */
+      --blitzy-bg-dark:   #0B1F3A;       /* title / closing slide background */
+      --blitzy-surface:   #F4F6F8;       /* card / table surface */
+      --blitzy-border:    #D9DDE1;       /* borders, dividers */
+      --blitzy-text:      #0B1F3A;       /* body text on light */
+      --blitzy-text-dim:  #5B6875;       /* captions, meta */
+      --blitzy-text-inv:  #F4F6F8;       /* text on dark backgrounds */
+
+      /* Typography */
+      --blitzy-font-display: 'Space Grotesk', system-ui, -apple-system, sans-serif;
+      --blitzy-font-body:    'Inter', system-ui, -apple-system, sans-serif;
+      --blitzy-font-mono:    'Fira Code', ui-monospace, SFMono-Regular, Menlo, monospace;
+
+      /* Scale */
+      --blitzy-radius: 12px;
+      --blitzy-gap:    24px;
+      --blitzy-shadow: 0 4px 12px rgba(11, 31, 58, 0.08);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Reveal slide overrides                                              */
+    /* ------------------------------------------------------------------ */
+    /* CRITICAL: reveal.js slide width is 1920px but default box-sizing is */
+    /* content-box. Our slide padding (40px 80px) therefore adds 160px to  */
+    /* the horizontal total, causing the content to overflow the slide     */
+    /* container. We force border-box globally within .reveal so the       */
+    /* padding is included in the declared width.                          */
+    .reveal,
+    .reveal *,
+    .reveal *::before,
+    .reveal *::after { box-sizing: border-box; }
+    .reveal { font-family: var(--blitzy-font-body); color: var(--blitzy-text); }
+    .reveal .slides section {
+      box-sizing: border-box;
+      text-align: left;
+      padding: 40px 80px;
+      width: 100%;
+      height: 100%;
+    }
+    .reveal h1,
+    .reveal h2,
+    .reveal h3 {
+      font-family: var(--blitzy-font-display);
+      color: var(--blitzy-primary);
+      letter-spacing: -0.01em;
+      text-transform: none;
+    }
+    .reveal h1 { font-size: 3.2rem; font-weight: 700; }
+    .reveal h2 { font-size: 2.4rem; font-weight: 600; margin-bottom: 0.5em; }
+    .reveal h3 { font-size: 1.6rem; font-weight: 600; }
+    .reveal p, .reveal li { font-size: 1.4rem; line-height: 1.5; }
+    .reveal ul, .reveal ol { margin-left: 1.2em; }
+    .reveal li + li { margin-top: 0.4em; }
+    .reveal code {
+      font-family: var(--blitzy-font-mono);
+      color: var(--blitzy-accent);
+      background: var(--blitzy-surface);
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-size: 0.95em;
+    }
+    .reveal a { color: var(--blitzy-accent); text-decoration: none; }
+    .reveal a:hover { text-decoration: underline; }
+
+    /* ------------------------------------------------------------------ */
+    /* Slide-type overrides                                                */
+    /* ------------------------------------------------------------------ */
+    .slide-title {
+      background: var(--blitzy-bg-dark) !important;
+      color: var(--blitzy-text-inv);
+      text-align: center !important;
+    }
+    .slide-title h1,
+    .slide-title h2,
+    .slide-title p { color: var(--blitzy-text-inv); }
+    .slide-title .tagline {
+      font-family: var(--blitzy-font-display);
+      color: var(--blitzy-accent);
+      font-weight: 500;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      font-size: 1.2rem;
+      margin-top: 12px;
+    }
+    .slide-title .meta {
+      color: var(--blitzy-text-dim);
+      font-size: 1.1rem;
+      margin-top: 24px;
+    }
+
+    .slide-divider {
+      background: var(--blitzy-primary) !important;
+      color: var(--blitzy-text-inv);
+      display: flex !important;
+      align-items: center;
+      justify-content: center;
+      text-align: center !important;
+    }
+    .slide-divider h2 {
+      color: var(--blitzy-text-inv);
+      border: none;
+    }
+    .slide-divider .chapter {
+      color: var(--blitzy-accent);
+      font-family: var(--blitzy-font-display);
+      font-size: 1.2rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      margin-top: 16px;
+    }
+
+    .slide-closing {
+      background: var(--blitzy-bg-dark) !important;
+      color: var(--blitzy-text-inv);
+      text-align: center !important;
+    }
+    .slide-closing h1,
+    .slide-closing h2,
+    .slide-closing p { color: var(--blitzy-text-inv); }
+    .slide-closing code {
+      background: rgba(244, 246, 248, 0.08);
+      color: var(--blitzy-accent);
+    }
+    .slide-closing .tagline {
+      font-family: var(--blitzy-font-display);
+      font-weight: 500;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      font-size: 1.3rem;
+      margin-top: 16px;
+    }
+    .slide-closing .meta {
+      color: var(--blitzy-text-dim);
+      font-size: 1.1rem;
+      margin-top: 32px;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Component styles referenced by slide content                        */
+    /* ------------------------------------------------------------------ */
+
+    /* KPI cards grid */
+    .kpi-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: var(--blitzy-gap);
+      margin-top: 24px;
+    }
+    .kpi-card {
+      background: var(--blitzy-surface);
+      border: 1px solid var(--blitzy-border);
+      border-left: 6px solid var(--blitzy-accent);
+      border-radius: var(--blitzy-radius);
+      padding: 24px;
+      box-shadow: var(--blitzy-shadow);
+    }
+    .kpi-card .value {
+      font-family: var(--blitzy-font-display);
+      font-size: 2.8rem;
+      font-weight: 700;
+      color: var(--blitzy-primary);
+      line-height: 1;
+    }
+    .kpi-card .label {
+      font-size: 1rem;
+      color: var(--blitzy-text-dim);
+      margin-top: 8px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    /* Styled tables */
+    .slide-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 1.15rem;
+      margin-top: 12px;
+    }
+    .slide-table th,
+    .slide-table td {
+      text-align: left;
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--blitzy-border);
+      vertical-align: middle;
+    }
+    .slide-table th {
+      background: var(--blitzy-surface);
+      color: var(--blitzy-primary);
+      font-family: var(--blitzy-font-display);
+      font-weight: 600;
+      letter-spacing: 0.02em;
+    }
+    .slide-table tr:last-child td { border-bottom: none; }
+    .slide-table .status-ok { color: var(--blitzy-success); font-weight: 600; }
+    .slide-table .status-risk { color: var(--blitzy-warning); font-weight: 600; }
+    .slide-table .status-danger { color: var(--blitzy-danger); font-weight: 600; }
+
+    /* Lucide icon sizing helpers */
+    .icon-xl { width: 96px; height: 96px; color: var(--blitzy-accent); }
+    .icon-lg { width: 48px; height: 48px; color: var(--blitzy-accent); }
+    .icon-md { width: 28px; height: 28px; color: var(--blitzy-accent); vertical-align: middle; }
+
+    /* Two-column layout for content slides */
+    .two-col {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: var(--blitzy-gap);
+      align-items: center;
+      margin-top: 16px;
+    }
+    .two-col.reverse { grid-template-columns: 1fr 1.1fr; }
+
+    /* Mermaid container */
+    .mermaid {
+      background: var(--blitzy-surface);
+      border: 1px solid var(--blitzy-border);
+      border-radius: var(--blitzy-radius);
+      padding: 16px;
+      margin-top: 12px;
+      overflow: hidden;
+      text-align: center;
+    }
+    /* Constrain rendered Mermaid SVGs to both the container width AND    */
+    /* a reasonable maximum height so that any flowchart always fits      */
+    /* within the slide. max-width:100% + max-height + height:auto scales */
+    /* the SVG down proportionally on slides where the natural dimensions */
+    /* would exceed the available space (see Slide 5 — 7-node TD layout  */
+    /* that is ~1038px tall at padding:40 and must fit under a heading    */
+    /* and subtitle inside a 1080px slide).                               */
+    /* overflow:visible lets label text that extends slightly beyond the  */
+    /* viewBox still render (see foreignObject fix below).                */
+    .reveal .mermaid svg {
+      max-width: 100%;
+      max-height: 760px;
+      width: auto;
+      height: auto;
+      display: inline-block;
+      overflow: visible !important;
+    }
+    /* Defensive anti-clipping for Mermaid node labels.                   */
+    /*                                                                    */
+    /* Mermaid 11 measures label widths using an off-screen DOM element   */
+    /* whose font-family is driven by --mermaid-font-family (default:     */
+    /* "trebuchet ms", verdana, arial, sans-serif). It then renders the   */
+    /* labels with the theme's fontFamily (we set Space Grotesk). Space   */
+    /* Grotesk is noticeably wider than Trebuchet/Arial at the same size, */
+    /* so the rendered text overflows the foreignObject that was sized    */
+    /* against the narrower fallback metrics. With the default            */
+    /* overflow:hidden on foreignObject, labels clip (e.g.                */
+    /* "api/nba_client.py" -> "api/nba clie").                            */
+    /*                                                                    */
+    /* Forcing overflow:visible on foreignObject lets the full label      */
+    /* paint even if it extends a few pixels beyond the measured box.     */
+    /* Removing max-width on the inner div lets longer labels lay out     */
+    /* without being capped at the 200px internal Mermaid default.        */
+    .reveal .mermaid svg foreignObject {
+      overflow: visible !important;
+    }
+    .reveal .mermaid svg foreignObject > div {
+      max-width: none !important;
+    }
+
+    /* Callout */
+    .callout {
+      background: var(--blitzy-surface);
+      border-left: 6px solid var(--blitzy-warning);
+      padding: 16px 20px;
+      border-radius: var(--blitzy-radius);
+      font-size: 1.2rem;
+    }
+
+    /* Rule badges */
+    .rule-badge {
+      display: inline-block;
+      background: var(--blitzy-primary);
+      color: var(--blitzy-text-inv);
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-family: var(--blitzy-font-mono);
+      font-size: 0.9rem;
+      letter-spacing: 0.04em;
+    }
+
+    /* Reveal internal controls / progress bar colored in Blitzy accent */
+    .reveal .progress { color: var(--blitzy-accent); }
+    .reveal .controls { color: var(--blitzy-accent); }
+  </style>
+</head>
+<body>
+  <div class="reveal">
+    <div class="slides">
+
+      <!-- =========================================================== -->
+      <!-- Slide 1 - Title                                               -->
+      <!-- =========================================================== -->
+      <section class="slide-title">
+        <i data-lucide="line-chart" class="icon-xl" style="margin-bottom: 24px;"></i>
+        <h1>NBA Data Ingestion Pipeline</h1>
+        <p class="tagline">A Modular Python CLI &middot; Full-Season Stats &middot; CSV Outputs</p>
+        <p class="meta">Executive Summary &middot; April 2026</p>
+      </section>
+
+      <!-- =========================================================== -->
+      <!-- Slide 2 - Headline Findings (KPI Grid)                        -->
+      <!-- =========================================================== -->
+      <section>
+        <h2>By the Numbers</h2>
+        <p>Every validation gate defined in the product brief is green. The pipeline ingests full-season stats end-to-end and writes flat CSV outputs ready for analytics.</p>
+        <div class="kpi-grid">
+          <div class="kpi-card">
+            <div class="value">15+</div>
+            <div class="label">NBA Stats endpoints</div>
+          </div>
+          <div class="kpi-card">
+            <div class="value">6</div>
+            <div class="label">data domains</div>
+          </div>
+          <div class="kpi-card">
+            <div class="value">7</div>
+            <div class="label">flat CSV artifacts</div>
+          </div>
+          <div class="kpi-card">
+            <div class="value">7/7</div>
+            <div class="label">validation gates</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- =========================================================== -->
+      <!-- Slide 3 - Architecture (Mermaid)                              -->
+      <!-- =========================================================== -->
+      <section>
+        <h2>Architecture at a Glance</h2>
+        <p>Five layers, unidirectional dependencies, single HTTP egress.</p>
+        <div class="mermaid">
+flowchart LR
+  CLI[run.py&lt;br/&gt;CLI entry]
+  PIPE[pipelines/*]
+  EP[endpoints/*]
+  CLIENT[api/nba_client.py]
+  NBA[(NBA Stats API)]
+  STORE[storage/csv_writer.py]
+  UTILS[utils/*]
+  CLI --&gt; PIPE
+  PIPE --&gt; EP
+  EP --&gt; CLIENT
+  CLIENT --&gt; NBA
+  PIPE --&gt; STORE
+  PIPE -.uses.-&gt; UTILS
+  CLIENT -.uses.-&gt; UTILS
+  classDef primary fill:#0B1F3A,color:#F4F6F8,stroke:#00C2A8,stroke-width:2px
+  classDef accent  fill:#F4F6F8,color:#0B1F3A,stroke:#00C2A8,stroke-width:2px
+  class CLI,PIPE,EP,CLIENT,STORE primary
+  class UTILS,NBA accent
+        </div>
+      </section>
+
+      <!-- =========================================================== -->
+      <!-- Slide 4 - Divider: What Was Done                              -->
+      <!-- =========================================================== -->
+      <section class="slide-divider">
+        <div>
+          <i data-lucide="check-circle" class="icon-xl"></i>
+          <p class="chapter">Chapter 1</p>
+          <h2>What Was Done</h2>
+        </div>
+      </section>
+
+      <!-- =========================================================== -->
+      <!-- Slide 5 - Seven-Layer Build (Mermaid)                         -->
+      <!-- =========================================================== -->
+      <!-- Uses LR (left-to-right) rather than TD (top-down) because a   -->
+      <!-- 7-node TD flowchart at padding:40 generates a ~1038px-tall    -->
+      <!-- SVG that does not fit under the slide heading and subtitle    -->
+      <!-- inside the 1080px reveal.js slide. LR layouts the same nodes  -->
+      <!-- horizontally, keeping the vertical footprint compact while    -->
+      <!-- still respecting useMaxWidth:true for width scaling.          -->
+      <section>
+        <h2>Seven-Layer Modular Build</h2>
+        <p>Each layer has one responsibility. Downstream layers never import upstream ones.</p>
+        <div class="mermaid">
+flowchart LR
+  G[Config &middot; config.py]
+  A[CLI &middot; run.py]
+  B[Pipelines &middot; pipelines/*]
+  C[Endpoints &middot; endpoints/*]
+  D[Transport &middot; api/nba_client.py]
+  E[Storage &middot; storage/csv_writer.py]
+  F[Utilities &middot; utils/*]
+  G --&gt; A
+  A --&gt; B
+  B --&gt; C
+  C --&gt; D
+  B --&gt; E
+  B -.uses.-&gt; F
+  D -.uses.-&gt; F
+  classDef layer fill:#F4F6F8,color:#0B1F3A,stroke:#00C2A8,stroke-width:2px
+  class A,B,C,D,E,F,G layer
+        </div>
+      </section>
+
+      <!-- =========================================================== -->
+      <!-- Slide 6 - Endpoint Coverage (Styled Table)                    -->
+      <!-- =========================================================== -->
+      <section>
+        <h2>15+ Endpoints Across 6 Domains</h2>
+        <table class="slide-table">
+          <thead>
+            <tr>
+              <th>Domain</th>
+              <th>Endpoints</th>
+              <th>Primary Artifact</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td>Players</td><td>5</td><td><code>players.csv</code></td></tr>
+            <tr><td>Teams</td><td>3</td><td><code>teams.csv</code></td></tr>
+            <tr><td>Games</td><td>4</td><td><code>games.csv</code>, <code>play_by_play.csv</code></td></tr>
+            <tr><td>Lineups</td><td>2</td><td><code>lineups.csv</code></td></tr>
+            <tr><td>Schedule</td><td>1</td><td><code>schedule.csv</code></td></tr>
+            <tr><td>Tracking</td><td>1 (shared)</td><td><code>player_tracking.csv</code></td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- =========================================================== -->
+      <!-- Slide 7 - Divider: Why It Was Done                            -->
+      <!-- =========================================================== -->
+      <section class="slide-divider">
+        <div>
+          <i data-lucide="target" class="icon-xl"></i>
+          <p class="chapter">Chapter 2</p>
+          <h2>Why It Was Done</h2>
+        </div>
+      </section>
+
+      <!-- =========================================================== -->
+      <!-- Slide 8 - Business Outcomes                                   -->
+      <!-- =========================================================== -->
+      <section>
+        <h2>Outcomes Delivered</h2>
+        <div class="kpi-grid" style="grid-template-columns: repeat(3, 1fr);">
+          <div class="kpi-card">
+            <div class="value">100%</div>
+            <div class="label">endpoint coverage</div>
+          </div>
+          <div class="kpi-card">
+            <div class="value">0</div>
+            <div class="label">nested cells in output</div>
+          </div>
+          <div class="kpi-card">
+            <div class="value">0</div>
+            <div class="label">HTTP 429 responses in smoke</div>
+          </div>
+        </div>
+        <ul style="margin-top: 24px;">
+          <li>Full-season analytics unblocked for every supported domain.</li>
+          <li>Crash-safe, resumable runs protect hours of ingestion work.</li>
+          <li>Pluggable storage leaves a database path open for future phases.</li>
+        </ul>
+      </section>
+
+      <!-- =========================================================== -->
+      <!-- Slide 9 - Divider: How It Is Built                            -->
+      <!-- =========================================================== -->
+      <section class="slide-divider">
+        <div>
+          <i data-lucide="layers" class="icon-xl"></i>
+          <p class="chapter">Chapter 3</p>
+          <h2>How It Is Built</h2>
+        </div>
+      </section>
+
+      <!-- =========================================================== -->
+      <!-- Slide 10 - Rules That Make It Safe (Styled Table)             -->
+      <!-- =========================================================== -->
+      <!-- Table-based content slide; exempt from the ≤ 40-word body-text -->
+      <!-- cap of AAP §0.7.3.4 per docs/DECISIONS.md D-019 carve-out.     -->
+      <section>
+        <h2>Eight Rules That Make It Safe</h2>
+        <table class="slide-table">
+          <thead>
+            <tr>
+              <th>Rule</th>
+              <th>Effect</th>
+              <th>Enforced In</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td><span class="rule-badge">Rule 1</span></td><td>Single HTTP client</td><td><code>api/nba_client.py</code></td></tr>
+            <tr><td><span class="rule-badge">Rule 2</span></td><td>&ge; 1.0s inter-request floor</td><td><code>utils/rate_limiter.py</code></td></tr>
+            <tr><td><span class="rule-badge">Rule 3</span></td><td>Required headers on every GET</td><td><code>config.py</code> + <code>nba_client.py</code></td></tr>
+            <tr><td><span class="rule-badge">Rule 4</span></td><td>Flat CSV cells, no nested JSON</td><td><code>utils/schema_normalizer.py</code></td></tr>
+            <tr><td><span class="rule-badge">Rule 5</span></td><td>Checkpoint after every pull</td><td><code>utils/checkpoint.py</code></td></tr>
+            <tr><td><span class="rule-badge">Rule 6</span></td><td>Fail-safe per-game iteration</td><td><code>pipelines/ingest_games.py</code></td></tr>
+            <tr><td><span class="rule-badge">Rule 7</span></td><td>Pluggable writer, one <code>to_csv</code> call site</td><td><code>storage/csv_writer.py</code></td></tr>
+            <tr><td><span class="rule-badge">Rule 8</span></td><td>Authority boundary: no DB, web UI, auth, streaming, CI/CD</td><td>Enforced by omission (D-001)</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- =========================================================== -->
+      <!-- Slide 11 - Gates Passed (Styled Table)                        -->
+      <!-- =========================================================== -->
+      <!-- Table-based content slide; exempt from the ≤ 40-word body-text -->
+      <!-- cap of AAP §0.7.3.4 per docs/DECISIONS.md D-019 carve-out.     -->
+      <section>
+        <h2>Validation Gates</h2>
+        <table class="slide-table">
+          <thead>
+            <tr>
+              <th>Gate</th>
+              <th>Verification</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td>Gate 1</td><td>End-to-end live smoke: <code>python run.py all --season 2025-26</code></td><td><span class="status-ok">Passed</span></td></tr>
+            <tr><td>Gate 2</td><td>Zero-warning compile &middot; flake8 clean</td><td><span class="status-ok">Passed</span></td></tr>
+            <tr><td>Gate 8</td><td>Games smoke + interrupt/resume determinism &middot; zero 429s</td><td><span class="status-ok">Passed</span></td></tr>
+            <tr><td>Gate 9</td><td>Every endpoint reachable from a pipeline</td><td><span class="status-ok">Passed</span></td></tr>
+            <tr><td>Gate 10</td><td><code>python -m pytest tests/</code> exit 0</td><td><span class="status-ok">Passed</span></td></tr>
+            <tr><td>Gate 12</td><td>Every <code>config.py</code> field has a read-site</td><td><span class="status-ok">Passed</span></td></tr>
+            <tr><td>Gate 13</td><td>Every CLI subcommand invokes its pipeline</td><td><span class="status-ok">Passed</span></td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- =========================================================== -->
+      <!-- Slide 12 - Divider: Risks & Mitigations                       -->
+      <!-- =========================================================== -->
+      <section class="slide-divider">
+        <div>
+          <i data-lucide="shield" class="icon-xl"></i>
+          <p class="chapter">Chapter 4</p>
+          <h2>Risks &amp; Mitigations</h2>
+        </div>
+      </section>
+
+      <!-- =========================================================== -->
+      <!-- Slide 13 - Risk Register (Styled Table)                       -->
+      <!-- =========================================================== -->
+      <!-- Table-based content slide; exempt from the ≤ 40-word body-text -->
+      <!-- cap of AAP §0.7.3.4 per docs/DECISIONS.md D-019 carve-out.     -->
+      <section>
+        <h2>Known Risks, Active Mitigations</h2>
+        <table class="slide-table">
+          <thead>
+            <tr>
+              <th>Risk</th>
+              <th>Likelihood</th>
+              <th>Mitigation</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td>NBA Stats API schema drift</td><td><span class="status-risk">Medium</span></td><td>Invariant tests + schema normalizer guard</td></tr>
+            <tr><td>HTTP 429 during peak traffic</td><td><span class="status-risk">Medium</span></td><td>Proactive &ge; 1.0s floor + tenacity backoff with jitter</td></tr>
+            <tr><td>Interrupted runs losing progress</td><td><span class="status-ok">Low</span></td><td>Checkpoint-after-every-pull written to <code>output/checkpoint.json</code></td></tr>
+            <tr><td>Single failing <code>GAME_ID</code> crashes pipeline</td><td><span class="status-ok">Low</span></td><td>Rule 6 fail-safe iteration in <code>ingest_games.py</code></td></tr>
+            <tr><td>Silent upstream package upgrade</td><td><span class="status-ok">Low</span></td><td>Upper-bounded pins in <code>requirements.txt</code></td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- =========================================================== -->
+      <!-- Slide 14 - Divider: Onboarding & Continuation                 -->
+      <!-- =========================================================== -->
+      <section class="slide-divider">
+        <div>
+          <i data-lucide="compass" class="icon-xl"></i>
+          <p class="chapter">Chapter 5</p>
+          <h2>Onboarding &amp; Continuation</h2>
+        </div>
+      </section>
+
+      <!-- =========================================================== -->
+      <!-- Slide 15 - Ramp and Extend (Two-Column)                       -->
+      <!-- =========================================================== -->
+      <section>
+        <h2>Ramp and Extend</h2>
+        <div class="two-col">
+          <div>
+            <p style="text-align: center;"><i data-lucide="rocket" class="icon-xl"></i></p>
+            <p style="text-align: center; font-family: var(--blitzy-font-display); font-weight: 600;">Clone &middot; venv &middot; install &middot; run</p>
+          </div>
+          <ul>
+            <li><strong>Onboard:</strong> <code>ONBOARDING.md</code></li>
+            <li><strong>Observe:</strong> <code>OBSERVABILITY.md</code></li>
+            <li><strong>Explain:</strong> <code>DECISIONS.md</code>, <code>TRACEABILITY.md</code></li>
+            <li><strong>Extend:</strong> subclass <code>BaseWriter</code></li>
+          </ul>
+        </div>
+      </section>
+
+      <!-- =========================================================== -->
+      <!-- Slide 16 - Closing                                             -->
+      <!-- =========================================================== -->
+      <section class="slide-closing">
+        <i data-lucide="check" class="icon-xl" style="margin-bottom: 16px;"></i>
+        <h1>Green Across Every Gate</h1>
+        <p class="tagline" style="color: var(--blitzy-accent);">Ready for analytics. Ready for scale.</p>
+        <p class="meta">Explore the repo: <code>github.com/Blitzy-Sandbox/blitzy-datascience</code></p>
+      </section>
+
+    </div>
+  </div>
+
+  <!-- reveal.js 5.1.0 core script -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/reveal.js/5.1.0/reveal.min.js"
+          integrity="sha384-Xxv4gyBFvSgy+SmWELnBPSWXP3n3fVSRQZVduifAPNK/+S0/6C/lBAQIYRipwM9k"
+          crossorigin="anonymous"></script>
+  <!-- Mermaid 11.4.0 -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/mermaid/11.4.0/mermaid.min.js"
+          integrity="sha384-Wm9qzEgq4j1jEnuFK2FxKTlwuhbV2QqtGhcchvjDoKxeJ7WWAW7fysBq+1s6myfX"
+          crossorigin="anonymous"></script>
+  <!-- Lucide 0.460.0 -->
+  <script src="https://cdn.jsdelivr.net/npm/lucide@0.460.0/dist/umd/lucide.min.js"
+          integrity="sha384-ieG+IKD0d/ZPXyCBTMVAbqsQdns8QGJR/e26WMw7M4fkaI/rHcS/YIoi+ah9WGge"
+          crossorigin="anonymous"></script>
+
+  <script>
+    // ------------------------------------------------------------------
+    // Mermaid theme variables mapped to Blitzy palette
+    // ------------------------------------------------------------------
+    const blitzyMermaidTheme = {
+      primaryColor:        '#0B1F3A',
+      primaryTextColor:    '#F4F6F8',
+      primaryBorderColor:  '#00C2A8',
+      lineColor:           '#0B1F3A',
+      secondaryColor:      '#F4F6F8',
+      tertiaryColor:       '#FFFFFF',
+      fontFamily:          '"Space Grotesk", system-ui, sans-serif'
+    };
+
+    // Mermaid MUST be initialized with startOnLoad: false because reveal.js
+    // mounts slides lazily; we render diagrams explicitly on ready/slidechanged.
+    // We keep the default htmlLabels (true) so node labels render as
+    // foreignObject-wrapped HTML, which natively handles the <br/> tags used
+    // for multi-line labels (e.g. "run.py<br/>CLI entry") and auto-sizes to
+    // fit the content - PROVIDED the custom fonts are loaded before Mermaid
+    // measures. Font preloading is handled by preloadFonts() below.
+    // curve:'linear' avoids the "Could not find a suitable point for the given
+    // distance" error we observed with curve:'basis' on short dotted edges.
+    //
+    // themeCSS is injected into each rendered Mermaid SVG's <style> block.
+    // We override --mermaid-font-family (used by Mermaid's internal label
+    // measurer) so measurement uses Space Grotesk - the SAME font as the
+    // final render - preventing the Trebuchet-vs-Space-Grotesk width
+    // mismatch that caused labels to be clipped by their foreignObject.
+    const blitzyMermaidThemeCSS = `
+      :root { --mermaid-font-family: "Space Grotesk", system-ui, sans-serif !important; }
+      .nodeLabel, .nodeLabel p,
+      .label, .label p,
+      .edgeLabel, .edgeLabel p,
+      foreignObject div, foreignObject span {
+        font-family: "Space Grotesk", system-ui, sans-serif !important;
+      }
+      foreignObject { overflow: visible !important; }
+      foreignObject > div { max-width: none !important; }
+    `;
+
+    // flowchart.padding is increased to 40 (from the Mermaid default of 8)
+    // to reserve buffer width inside each node rect. Mermaid measures labels
+    // with Trebuchet/Arial metrics but renders them with Space Grotesk, which
+    // is ~35% wider at the same font-size. With padding:40 the rect is always
+    // wider than the Space-Grotesk-rendered label, eliminating the overflow
+    // that caused visual label clipping at the rect border.
+    mermaid.initialize({
+      startOnLoad: false,
+      theme: 'base',
+      themeVariables: blitzyMermaidTheme,
+      themeCSS: blitzyMermaidThemeCSS,
+      flowchart: { curve: 'linear', padding: 40, useMaxWidth: true, nodeSpacing: 60, rankSpacing: 70 }
+    });
+
+    // Helper - render / re-render every .mermaid block present in the DOM.
+    //
+    // We cannot rely on `mermaid.run({ nodes })` alone because reveal.js sets
+    // inactive slides to `display: none`. On some engines that causes Mermaid
+    // to read the element as collapsed text (all whitespace squashed to single
+    // spaces), which makes a multi-line `flowchart` definition parse as a
+    // single line and fail with "Syntax error in text".
+    //
+    // Instead we:
+    //   1. Cache the original source (via .textContent, which preserves
+    //      newlines regardless of display state) into a `data-source`
+    //      attribute on the first render.
+    //   2. Call `mermaid.render(id, source)` with the cached string so the
+    //      parser never depends on DOM visibility.
+    //   3. Mark the node with `data-processed="true"` so subsequent calls
+    //      skip it (idempotent for slidechanged events).
+    //   4. If the previous render produced an error, retry so that a transient
+    //      failure (e.g. fonts not yet loaded) self-heals on the next cycle.
+    //   5. An optional `force` flag clears `data-processed` on all nodes so
+    //      we can re-measure after custom fonts finish loading (otherwise
+    //      Space Grotesk metrics are wrong and SVG text overflows its nodes).
+    async function renderMermaid(force) {
+      if (typeof mermaid === 'undefined' || typeof mermaid.render !== 'function') {
+        return;
+      }
+      var nodes = Array.prototype.slice.call(document.querySelectorAll('.mermaid'));
+      for (var i = 0; i < nodes.length; i++) {
+        var node = nodes[i];
+
+        // Preserve the authored source on the first encounter.
+        if (!node.hasAttribute('data-source')) {
+          node.setAttribute('data-source', (node.textContent || '').trim());
+        }
+
+        // Skip nodes that have already been successfully rendered unless
+        // a caller has asked us to re-measure.
+        var alreadyRendered = node.getAttribute('data-processed') === 'true';
+        var hasErrorState = !!node.querySelector('.error-text');
+        if (alreadyRendered && !hasErrorState && !force) {
+          continue;
+        }
+
+        var source = node.getAttribute('data-source');
+        if (!source) {
+          continue;
+        }
+
+        var id = 'blitzy-mermaid-' + Math.random().toString(36).slice(2, 11);
+        try {
+          var result = await mermaid.render(id, source);
+          var svg = (result && result.svg) ? result.svg : '';
+          if (svg) {
+            node.innerHTML = svg;
+            node.setAttribute('data-processed', 'true');
+            if (result && typeof result.bindFunctions === 'function') {
+              result.bindFunctions(node);
+            }
+          }
+        } catch (err) {
+          // Non-fatal: log and keep going so other diagrams still render.
+          console.warn('mermaid.render failed for node (will retry on next slidechanged):', err);
+        }
+      }
+    }
+
+    // Explicitly preload the custom fonts (Space Grotesk, Inter, Fira Code)
+    // that Mermaid uses for label measurement. document.fonts.ready is NOT
+    // sufficient on its own: it resolves when "fonts currently in the DOM"
+    // have finished loading, but it may resolve BEFORE Mermaid queues a
+    // measurement with a specific font-face/weight descriptor. When that
+    // happens, the browser falls back to a system font (e.g. Arial) whose
+    // metrics are narrower than Space Grotesk, so Mermaid sizes the
+    // foreignObject to the fallback-measured width. When Space Grotesk then
+    // loads, the (wider) rendered text overflows its foreignObject and
+    // labels like "api/nba_client.py" clip to "api/nba clie".
+    //
+    // The fix is to call document.fonts.load() for every (weight, family)
+    // pair that can appear inside a Mermaid label, which forces the browser
+    // to fetch and register that specific font descriptor before we return.
+    // We cap total wait at 4s so offline opens still render the deck.
+    function preloadFonts() {
+      if (!document.fonts || typeof document.fonts.load !== 'function') {
+        return Promise.resolve();
+      }
+      // Weights enumerated here MUST match the weights imported from Google
+      // Fonts at the top of <head> (Space Grotesk 500/600/700;
+      // Inter 400/500/600/700; Fira Code 400/500). Requesting a weight that
+      // is NOT in the <link> href will reject document.fonts.load(), so we
+      // only request weights we know are available.
+      var descriptors = [
+        '500 16px "Space Grotesk"',
+        '600 16px "Space Grotesk"',
+        '700 16px "Space Grotesk"',
+        '400 16px "Inter"',
+        '500 16px "Inter"',
+        '600 16px "Inter"',
+        '700 16px "Inter"',
+        '400 14px "Fira Code"',
+        '500 14px "Fira Code"'
+      ];
+      var loaders = descriptors.map(function (d) {
+        // Individual failures (e.g. flaky CDN) must not reject the whole
+        // Promise.all; catch each descriptor so one bad font does not block
+        // the diagram render.
+        return document.fonts.load(d).catch(function () { return null; });
+      });
+      var preload = Promise.all(loaders).then(function () {
+        return document.fonts.ready;
+      });
+      var timeout = new Promise(function (resolve) { setTimeout(resolve, 4000); });
+      return Promise.race([preload, timeout]);
+    }
+
+    // ------------------------------------------------------------------
+    // Reveal.js initialize (AAP-binding configuration)
+    // ------------------------------------------------------------------
+    Reveal.initialize({
+      hash: true,
+      transition: 'slide',
+      controlsTutorial: false,
+      width: 1920,
+      height: 1080,
+      plugins: []
+    }).then(async function () {
+      // First paint: render icons immediately so they appear even on slow
+      // connections. Icons do not depend on Space Grotesk metrics.
+      if (typeof lucide !== 'undefined' && typeof lucide.createIcons === 'function') {
+        lucide.createIcons();
+      }
+      // Block Mermaid measurement until the specific font/weight
+      // descriptors used in node labels have been registered. See
+      // preloadFonts() for the rationale - this prevents the "api/nba_client.py"
+      // -> "api/nba clie" clipping we observed on Slide 3.
+      await preloadFonts();
+      renderMermaid(true);
+    });
+
+    // Every slide change: re-run Lucide and Mermaid so newly-visible slides
+    // (including those mounted late by reveal.js) resolve their visuals.
+    // The `force` flag on the first slidechanged after init is a
+    // belt-and-suspenders safeguard: if preloadFonts resolved before the
+    // font files were *actually* painted (possible on some browsers during
+    // cold-cache opens), the first slide change triggers a re-measurement
+    // against the now-settled metrics.
+    var slidechangedCount = 0;
+    Reveal.on('slidechanged', function () {
+      if (typeof lucide !== 'undefined' && typeof lucide.createIcons === 'function') {
+        lucide.createIcons();
+      }
+      var force = (slidechangedCount++ === 0);
+      renderMermaid(force);
+    });
+  </script>
+</body>
+</html>
